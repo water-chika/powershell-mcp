@@ -142,6 +142,27 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(records[-1]["failure"], "protocol")
         self.assertIn("SSH transport exited with status 255", records[-1]["message"])
 
+    def test_unlimited_lines_are_bounded_only_by_bytes(self) -> None:
+        body = r'''
+            import json, sys
+            def record(value):
+                sys.stdout.buffer.write(b"\x1e" + json.dumps(value).encode() + b"\n")
+            for sequence in range(1, 501):
+                record({"type":"output", "source":"remote", "sequence":sequence,
+                        "stream":"stdout", "text":"x"})
+            record({"type":"exit", "source":"remote", "sequence":501, "exit_code":0})
+            sys.stdout.buffer.flush()
+        '''
+        output = io.BytesIO()
+        argv = [sys.executable, "-c", textwrap.dedent(body)]
+        with patch("powershell_mcp.runner.launch_argv", return_value=argv):
+            status = execute(Host("test", "unused", "powershell"), "ignored", mode="powershell",
+                             max_lines=0, max_bytes=4096, pattern=None, timeout=5, output=output)
+        records = decode(output.getvalue())
+        self.assertEqual(status, 0)
+        self.assertEqual(records[-1]["exit_code"], 0)
+        self.assertEqual(sum(record.get("type") == "output" for record in records), 500)
+
     def test_timeout_preserves_protocol_error_details(self) -> None:
         status, records = self.run_helper(r'''
             import signal, sys, time

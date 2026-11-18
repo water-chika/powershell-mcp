@@ -321,11 +321,10 @@ def execute(
     diagnostic_lines = 0
     diagnostic_bytes = 0
     diagnostic_suppressed = 0
-    accepted_record_bytes = 0
-    accepted_record_count = 0
-    receive_limit = max_bytes * 8 + 1024 * 1024
-    receive_record_limit = max(max_lines if max_lines else 200, 200) + 256
-    timed_out = False
+    raw_stdout_bytes = 0
+    maximum_output_records = min(max_lines if max_lines else max_bytes, max_bytes)
+    receive_limit = max_bytes * 6 + maximum_output_records * 256 + 65536
+    cancellation_reason: str | None = None
 
     def emit_stderr_lines(text: str, *, final: bool = False) -> str:
         nonlocal diagnostic_lines, diagnostic_bytes, diagnostic_suppressed
@@ -358,19 +357,6 @@ def execute(
 
     def handle_remote_record(record: dict[str, object]) -> None:
         nonlocal remote_exit_count, pending_exit, saw_remote_exit, expected_remote_sequence
-        nonlocal accepted_record_bytes, accepted_record_count, timed_out, termination_deadline
-        accepted_record_count += 1
-        accepted_record_bytes += len(json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode())
-        if accepted_record_count > receive_record_limit or accepted_record_bytes > receive_limit:
-            add_protocol_error("receive-side record budget exceeded")
-            timed_out = True
-            if termination_deadline is None:
-                termination_deadline = time.monotonic() + 2.0
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            return
         record_type = record.get("type")
         if record_type == "protocol_error":
             add_protocol_error(str(record.get("message", "remote protocol error")))
@@ -401,8 +387,8 @@ def execute(
     try:
         while selector.get_map():
             now = time.monotonic()
-            if not timed_out and now >= request_deadline:
-                timed_out = True
+            if not cancellation_reason and now >= request_deadline:
+                cancellation_reason = "timeout"
                 if proc.poll() is None:
                     termination_deadline = now + 2.0
                     try:
@@ -411,7 +397,7 @@ def execute(
                         pass
                 elif drain_deadline is None:
                     drain_deadline = now + 2.0
-            if timed_out and termination_deadline is not None and now >= termination_deadline:
+            if cancellation_reason and termination_deadline is not None and now >= termination_deadline:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -430,7 +416,7 @@ def execute(
                 break
 
             wakeups = [now + 0.2]
-            if not timed_out:
+            if not cancellation_reason:
                 wakeups.append(request_deadline)
             if termination_deadline is not None:
                 wakeups.append(termination_deadline)
@@ -451,6 +437,17 @@ def execute(
                         stderr_text = emit_stderr_lines(stderr_text, final=True)
                     continue
                 if key.data == "stdout":
+                    raw_stdout_bytes += len(data)
+                    if raw_stdout_bytes > receive_limit and cancellation_reason is None:
+                        cancellation_reason = "receive_budget"
+                        add_protocol_error(
+                            f"receive-side byte budget exceeded ({raw_stdout_bytes}>{receive_limit})")
+                        termination_deadline = time.monotonic() + 2.0
+                        try:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        continue
                     for record in parser.feed(data):
                         handle_remote_record(record)
                 else:
@@ -486,20 +483,22 @@ def execute(
     if diagnostic_suppressed:
         emit({"type": "diagnostic", "stream": "stderr",
               "text": f"{diagnostic_suppressed} additional transport diagnostics suppressed"})
-    if timed_out:
+    if cancellation_reason:
         terminal: dict[str, object] = {
-            "type": "terminal", "failure": "timeout", "timeout_seconds": timeout,
+            "type": "terminal", "failure": cancellation_reason,
             "partial": True, "output_complete": False, "exit_code": None,
             "transport_exit_code": transport_rc, "cancellation_unconfirmed": True,
             "duration_ms": duration_ms,
         }
+        if cancellation_reason == "timeout":
+            terminal["timeout_seconds"] = timeout
         if protocol_errors or protocol_error_overflow:
             details = list(protocol_errors)
             if protocol_error_overflow:
                 details.append(f"{protocol_error_overflow} additional protocol errors suppressed")
-            terminal["message"] = "transport protocol errors before timeout: " + "; ".join(details)
+            terminal["message"] = f"transport protocol errors before {cancellation_reason}: " + "; ".join(details)
         emit(terminal)
-        return 124
+        return 124 if cancellation_reason == "timeout" else 1
 
     pending_exit_code = pending_exit.get("exit_code") if pending_exit is not None else None
     if host.transport == "ssh" and transport_rc != 0 and pending_exit_code == 0:
