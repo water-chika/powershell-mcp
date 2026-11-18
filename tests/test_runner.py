@@ -25,11 +25,15 @@ class ScriptTests(unittest.TestCase):
             import json, sys
             value = sys.stdin.read()
             def record(item):
+                if item.get("type") == "output":
+                    item.setdefault("line_count", item.get("text", "").count("\n") + 1)
+                    item.setdefault("trailing_delimiter_bytes", 1)
+                    item.setdefault("byte_count", len(item.get("text", "").encode()) + item["trailing_delimiter_bytes"])
                 sys.stdout.buffer.write(b"\x1e" + json.dumps(item).encode() + b"\n")
                 sys.stdout.buffer.flush()
             record({"type":"output", "source":"remote", "sequence":1,
                     "stream":"stdout", "text":"eof" if value == "" else "unexpected"})
-            record({"type":"exit", "source":"remote", "sequence":2, "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
+            record({"type":"exit", "source":"remote", "sequence":2, "exit_code":0, "observed_lines":1, "observed_bytes":4, "emitted_lines":1, "emitted_bytes":4, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
         ''')
         self.assertEqual(status, 0)
         self.assertIn("eof", [record.get("text") for record in records])
@@ -69,11 +73,15 @@ class ScriptTests(unittest.TestCase):
         status, records = self.run_helper(r'''
             import json, sys, time
             def record(value):
+                if value.get("type") == "output":
+                    value.setdefault("line_count", value.get("text", "").count("\n") + 1)
+                    value.setdefault("trailing_delimiter_bytes", 1)
+                    value.setdefault("byte_count", len(value.get("text", "").encode()) + value["trailing_delimiter_bytes"])
                 sys.stdout.buffer.write(b"\x1e" + json.dumps(value).encode() + b"\n")
                 sys.stdout.buffer.flush()
             record({"type":"output", "source":"remote", "sequence":1,
                     "stream":"stdout", "text":"ok"})
-            record({"type":"exit", "source":"remote", "sequence":2, "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
+            record({"type":"exit", "source":"remote", "sequence":2, "exit_code":0, "observed_lines":1, "observed_bytes":3, "emitted_lines":1, "emitted_bytes":3, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
             time.sleep(0.05)
             sys.stderr.write("late diagnostic\n"); sys.stderr.flush()
         ''')
@@ -91,7 +99,7 @@ class ScriptTests(unittest.TestCase):
             "trailing": 'record({"type":"exit", "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0}); record({"type":"output", "text":"late"})',
             "incomplete": 'sys.stdout.buffer.write(b"\\x1e{\\\"type\\\":\\\"exit\\\""); sys.stdout.buffer.flush()',
             "bad-exit-type": 'record({"type":"exit", "exit_code":"0"})',
-            "bad-counter": 'record({"type":"exit", "exit_code":0, "observed_lines":false})',
+            "bad-counter": 'record({"type":"exit", "exit_code":0, "observed_lines":false, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})',
             "reserved-terminal": 'record({"type":"terminal", "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0}); record({"type":"exit", "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})',
             "unknown-type": 'record({"type":"mystery"}); record({"type":"exit", "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})',
             "bad-sequence": 'record({"type":"output", "source":"remote", "sequence":2, "text":"x"}); record({"type":"exit", "source":"remote", "sequence":1, "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})',
@@ -101,6 +109,10 @@ class ScriptTests(unittest.TestCase):
                 status, records = self.run_helper(f'''
                     import json, sys
                     def record(value):
+                        if value.get("type") == "output":
+                            value.setdefault("line_count", value.get("text", "").count("\n") + 1)
+                            value.setdefault("trailing_delimiter_bytes", 1)
+                    value.setdefault("byte_count", len(value.get("text", "").encode()) + value["trailing_delimiter_bytes"])
                         sys.stdout.buffer.write(b"\\x1e" + json.dumps(value).encode() + b"\\n")
                         sys.stdout.buffer.flush()
                     {statements}
@@ -118,6 +130,20 @@ class ScriptTests(unittest.TestCase):
         texts = [record["text"] for record in blank["records"] if record.get("type") == "output"]
         self.assertEqual(texts, ["\nx"])
 
+    def test_oversized_newline_free_line_is_fully_suppressed(self) -> None:
+        from powershell_mcp.server import powershell_run
+        result = powershell_run(
+            "local", "[Console]::Out.Write('x' * 10000)", max_bytes=5000,
+            include_raw_records=True,
+        )
+        self.assertEqual(result["output"], "")
+        terminal = result["records"][-1]
+        self.assertEqual(terminal["observed_lines"], 1)
+        self.assertEqual(terminal["observed_bytes"], 10000)
+        self.assertEqual(terminal["emitted_lines"], 0)
+        self.assertEqual(terminal["byte_suppressed_lines"], 1)
+        self.assertEqual(terminal["byte_suppressed_bytes"], 10000)
+
     def test_real_powershell_preserves_stderr_before_later_stdout(self) -> None:
         from powershell_mcp.server import powershell_run
         result = powershell_run(
@@ -132,6 +158,10 @@ class ScriptTests(unittest.TestCase):
         status, records = self.run_helper(r'''
             import json, signal, sys, time
             def record(value):
+                if value.get("type") == "output":
+                    value.setdefault("line_count", value.get("text", "").count("\n") + 1)
+                    value.setdefault("trailing_delimiter_bytes", 1)
+                    value.setdefault("byte_count", len(value.get("text", "").encode()) + value["trailing_delimiter_bytes"])
                 sys.stdout.buffer.write(b"\x1e" + json.dumps(value).encode() + b"\n")
                 sys.stdout.buffer.flush()
             def stop(signum, frame):
@@ -164,11 +194,15 @@ class ScriptTests(unittest.TestCase):
         body = r'''
             import json, sys
             def record(value):
+                if value.get("type") == "output":
+                    value.setdefault("line_count", value.get("text", "").count("\n") + 1)
+                    value.setdefault("trailing_delimiter_bytes", 1)
+                    value.setdefault("byte_count", len(value.get("text", "").encode()) + value["trailing_delimiter_bytes"])
                 sys.stdout.buffer.write(b"\x1e" + json.dumps(value).encode() + b"\n")
             for sequence in range(1, 501):
                 record({"type":"output", "source":"remote", "sequence":sequence,
                         "stream":"stdout", "text":"x"})
-            record({"type":"exit", "source":"remote", "sequence":501, "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
+            record({"type":"exit", "source":"remote", "sequence":501, "exit_code":0, "observed_lines":500, "observed_bytes":1000, "emitted_lines":500, "emitted_bytes":1000, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
             sys.stdout.buffer.flush()
         '''
         output = io.BytesIO()

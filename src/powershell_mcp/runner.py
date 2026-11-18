@@ -181,7 +181,8 @@ $script:seenLines=0; $script:seenBytes=0; $script:sentLines=0; $script:sentBytes
 $script:filterLines=0; $script:filterBytes=0; $script:lineLines=0; $script:lineBytes=0; $script:byteLines=0; $script:byteBytes=0
 $script:hadError=$false; $script:nativeRc=$null
 $script:pendingText=@{{stdout='';stderr=''}}
-$script:outputStream=$null; $script:outputLines=[Collections.Generic.List[string]]::new(); $script:outputBatchBytes=0
+$script:droppingLine=@{{stdout=$false;stderr=$false}}; $script:droppedLineBytes=@{{stdout=0;stderr=0}}
+$script:outputStream=$null; $script:outputLines=[Collections.Generic.List[string]]::new(); $script:outputBatchBytes=0; $script:outputBatchDelimiterBytes=0
 function Send-Record([hashtable]$record) {{
   $script:seq++; $record.sequence=$script:seq; $record.source='remote'
   $json=$record | ConvertTo-Json -Compress -Depth 5
@@ -189,31 +190,57 @@ function Send-Record([hashtable]$record) {{
 }}
 $regex=$null
 if ($null -ne $pattern) {{
-  try {{ $regex=[regex]::new($pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase) }}
+  try {{ $regex=[regex]::new($pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase, [TimeSpan]::FromMilliseconds(100)) }}
   catch {{ Send-Record @{{type='exit'; exit_code=2; message=('wsh: bad -f pattern: ' + $_.Exception.Message); observed_lines=0; observed_bytes=0; emitted_lines=0; emitted_bytes=0; filter_suppressed_lines=0; filter_suppressed_bytes=0; line_suppressed_lines=0; line_suppressed_bytes=0; byte_suppressed_lines=0; byte_suppressed_bytes=0}}; exit 2 }}
 }}
 function Flush-Output {{
   if ($script:outputLines.Count -gt 0) {{
-    Send-Record @{{type='output'; stream=$script:outputStream; text=($script:outputLines -join "`n")}}
-    $script:outputLines.Clear(); $script:outputBatchBytes=0
+    $text=$script:outputLines -join "`n"
+    $internalDelimiterBytes=[Math]::Max(0,$script:outputLines.Count-1)
+    $trailingDelimiterBytes=$script:outputBatchDelimiterBytes-$internalDelimiterBytes
+    Send-Record @{{type='output'; stream=$script:outputStream; text=$text; line_count=$script:outputLines.Count; byte_count=$script:outputBatchBytes; trailing_delimiter_bytes=$trailingDelimiterBytes}}
+    $script:outputLines.Clear(); $script:outputBatchBytes=0; $script:outputBatchDelimiterBytes=0
   }}
 }}
 function Observe-Text([string]$text, [string]$stream, [bool]$final) {{
   $combined=$script:pendingText[$stream] + $text
-  $parts=[regex]::Split($combined, "`r?`n")
-  if (-not $final) {{
-    $script:pendingText[$stream]=$parts[-1]
-    $completeCount=$parts.Length-1
-  }} else {{
-    $script:pendingText[$stream]=''
-    $completeCount=$parts.Length
-    if (($completeCount -gt 0) -and ($parts[-1] -eq '')) {{ $completeCount-- }}
+  $start=0
+  for ($i=0; $i -lt $combined.Length; $i++) {{
+    if ($combined[$i] -eq "`n") {{
+      $length=$i-$start; if (($length -gt 0) -and ($combined[$i-1] -eq "`r")) {{ $length-- }}
+      $segment=$combined.Substring($start,$length)
+      if ($script:droppingLine[$stream]) {{
+        $script:droppedLineBytes[$stream] += [Text.Encoding]::UTF8.GetByteCount($segment) + 1
+        $script:seenLines++; $script:seenBytes += $script:droppedLineBytes[$stream]
+        $script:byteLines++; $script:byteBytes += $script:droppedLineBytes[$stream]
+        $script:droppingLine[$stream]=$false; $script:droppedLineBytes[$stream]=0
+      }} else {{ Observe-Line $segment $stream $true }}
+      $start=$i+1
+    }}
   }}
-  for ($i=0; $i -lt $completeCount; $i++) {{ Observe-Line $parts[$i] $stream }}
+  $remaining=$combined.Substring($start)
+  $remainingBytes=[Text.Encoding]::UTF8.GetByteCount($remaining)
+  if ($script:droppingLine[$stream]) {{
+    $script:droppedLineBytes[$stream] += $remainingBytes
+    $script:pendingText[$stream]=''
+    if ($final) {{
+      $script:seenLines++; $script:seenBytes += $script:droppedLineBytes[$stream]
+      $script:byteLines++; $script:byteBytes += $script:droppedLineBytes[$stream]
+      $script:droppingLine[$stream]=$false; $script:droppedLineBytes[$stream]=0
+    }}
+  }} elseif ($final) {{
+    if ($remaining.Length -gt 0) {{ Observe-Line $remaining $stream $false }}
+    $script:pendingText[$stream]=''
+  }} elseif ($remainingBytes -gt $byteLimit) {{
+    $script:droppingLine[$stream]=$true; $script:droppedLineBytes[$stream]=$remainingBytes
+    $script:pendingText[$stream]=''
+  }} else {{
+    $script:pendingText[$stream]=$remaining
+  }}
 }}
-function Observe-Line([string]$line, [string]$stream) {{
+function Observe-Line([string]$line, [string]$stream, [bool]$hadDelimiter) {{
       if ($stream -eq 'stderr') {{ $script:hadError=$true }}
-      $bytes=[Text.Encoding]::UTF8.GetByteCount($line + "`n")
+      $bytes=[Text.Encoding]::UTF8.GetByteCount($line) + $(if ($hadDelimiter) {{1}} else {{0}})
       $script:seenLines++; $script:seenBytes += $bytes
       $matched=($null -eq $regex) -or $regex.IsMatch($line)
       $withinLines=($lineLimit -eq 0) -or ($script:sentLines -lt $lineLimit)
@@ -227,11 +254,12 @@ function Observe-Line([string]$line, [string]$stream) {{
             ($script:outputBatchBytes + $bytes -gt 8192)) {{ Flush-Output }}
         if ($script:outputLines.Count -eq 0) {{ $script:outputStream=$stream }}
         $script:outputLines.Add($line); $script:outputBatchBytes += $bytes
+        if ($hadDelimiter) {{ $script:outputBatchDelimiterBytes++ }}
         $script:sentLines++; $script:sentBytes += $bytes
       }}
 }}
 try {{ {invoke}; Flush-Output }}
-catch {{ Flush-Output; Observe-Line $_.ToString() 'stderr'; Flush-Output; if ($script:nativeRc -eq $null) {{ $script:nativeRc=1 }} }}
+catch {{ Flush-Output; Observe-Line $_.ToString() 'stderr' $false; Flush-Output; if ($script:nativeRc -eq $null) {{ $script:nativeRc=1 }} }}
 $rc=$script:nativeRc
 if ($rc -eq $null) {{ $rc=if ($script:hadError) {{1}} else {{0}} }}
 Send-Record @{{type='exit'; exit_code=[int64]$rc; observed_lines=$script:seenLines; observed_bytes=$script:seenBytes; emitted_lines=$script:sentLines; emitted_bytes=$script:sentBytes; filter_suppressed_lines=$script:filterLines; filter_suppressed_bytes=$script:filterBytes; line_suppressed_lines=$script:lineLines; line_suppressed_bytes=$script:lineBytes; byte_suppressed_lines=$script:byteLines; byte_suppressed_bytes=$script:byteBytes}}
@@ -409,12 +437,24 @@ def execute(
         else:
             protocol_error_overflow += 1
 
+    protocol_diagnostics_emitted = 0
+    protocol_diagnostic_bytes = 0
+    received_output_lines = 0
+    received_output_bytes = 0
+
     def handle_remote_record(record: dict[str, object]) -> None:
         nonlocal remote_exit_count, pending_exit, saw_remote_exit, expected_remote_sequence
+        nonlocal protocol_diagnostics_emitted, protocol_diagnostic_bytes
+        nonlocal received_output_lines, received_output_bytes
         record_type = record.get("type")
         if record_type == "protocol_error":
-            add_protocol_error(str(record.get("message", "remote protocol error")))
-            emit(record)
+            message = str(record.get("message", "remote protocol error"))[:1024]
+            add_protocol_error(message)
+            encoded_size = len(message.encode("utf-8"))
+            if protocol_diagnostics_emitted < 8 and protocol_diagnostic_bytes + encoded_size <= 4096:
+                emit({"type": "protocol_error", "message": message})
+                protocol_diagnostics_emitted += 1
+                protocol_diagnostic_bytes += encoded_size
             return
         if record_type not in ("output", "exit"):
             add_protocol_error(f"unexpected remote record type {record_type!r}")
@@ -422,7 +462,25 @@ def execute(
         if record_type == "output":
             stream = record.get("stream")
             text = record.get("text")
-            if stream not in ("stdout", "stderr") or not isinstance(text, str):
+            line_count = record.get("line_count")
+            byte_count = record.get("byte_count")
+            trailing_delimiter_bytes = record.get("trailing_delimiter_bytes")
+            fields_valid = (
+                stream in ("stdout", "stderr") and isinstance(text, str) and
+                isinstance(line_count, int) and not isinstance(line_count, bool) and line_count >= 1 and
+                isinstance(byte_count, int) and not isinstance(byte_count, bool) and byte_count >= 0 and
+                isinstance(trailing_delimiter_bytes, int) and not isinstance(trailing_delimiter_bytes, bool) and trailing_delimiter_bytes >= 0
+            )
+            if fields_valid:
+                text_value = cast(str, text)
+                lines_value = cast(int, line_count)
+                bytes_value = cast(int, byte_count)
+                delimiters_value = cast(int, trailing_delimiter_bytes)
+                expected_lines = text_value.count("\n") + 1
+                expected_bytes = len(text_value.encode("utf-8")) + delimiters_value
+                fields_valid = (lines_value == expected_lines and
+                                delimiters_value in (0, 1) and bytes_value == expected_bytes)
+            if not fields_valid:
                 add_protocol_error("invalid output record fields")
                 return
         sequence = record.get("sequence")
@@ -442,6 +500,9 @@ def execute(
             return
         if saw_remote_exit:
             add_protocol_error(f"remote {record_type!r} record followed exit")
+            return
+        received_output_lines += cast(int, record["line_count"])
+        received_output_bytes += cast(int, record["byte_count"])
         emit(record)
 
     try:
@@ -501,6 +562,8 @@ def execute(
                         stderr_text = emit_stderr_lines(stderr_text, final=True)
                     continue
                 if key.data == "stdout":
+                    if cancellation_reason == "receive_budget":
+                        continue
                     raw_stdout_bytes += len(data)
                     if raw_stdout_bytes > receive_limit and cancellation_reason is None:
                         cancellation_reason = "receive_budget"
@@ -591,6 +654,17 @@ def execute(
         value = terminal.get(name, 0)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             invalid_fields.append(name)
+    if not invalid_fields:
+        if terminal["emitted_lines"] != received_output_lines:
+            invalid_fields.append("emitted_lines_mismatch")
+        if terminal["emitted_bytes"] != received_output_bytes:
+            invalid_fields.append("emitted_bytes_mismatch")
+        if terminal["observed_lines"] != (terminal["emitted_lines"] + terminal["filter_suppressed_lines"] +
+                                           terminal["line_suppressed_lines"] + terminal["byte_suppressed_lines"]):
+            invalid_fields.append("observed_lines_mismatch")
+        if terminal["observed_bytes"] != (terminal["emitted_bytes"] + terminal["filter_suppressed_bytes"] +
+                                           terminal["line_suppressed_bytes"] + terminal["byte_suppressed_bytes"]):
+            invalid_fields.append("observed_bytes_mismatch")
     if invalid_fields:
         emit({"type": "terminal", "failure": "protocol",
               "message": "invalid remote exit fields: " + ", ".join(invalid_fields),

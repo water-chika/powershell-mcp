@@ -121,10 +121,11 @@ def command_result_from_records(records: list[dict[str, object]], target: str,
         raise ToolError(f"invalid PowerShell runner terminal order (final record: {final_type!r})")
     terminal = terminals[0]
     protocol_records = [record for record in records if record.get("type") == "protocol_error"]
-    if protocol_records and terminal.get("failure") != "timeout":
+    structured_protocol_failures = {"timeout", "receive_budget"}
+    if protocol_records and terminal.get("failure") not in structured_protocol_failures:
         raise ToolError("PowerShell runner response contains a protocol error")
     if protocol_records and not isinstance(terminal.get("message"), str):
-        raise ToolError("timeout response omitted preceding protocol-error details")
+        raise ToolError("structured failure omitted preceding protocol-error details")
     ordered = [record for record in records if record.get("type") in ("output", "diagnostic")]
     output_text = "\n".join(str(record.get("text", "")) for record in ordered)
     result = CommandResult(host=target, output=output_text, records=records)
