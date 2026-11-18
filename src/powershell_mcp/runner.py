@@ -276,9 +276,15 @@ try {{ {invoke}; Flush-Output }}
 catch {{
   Flush-Output
   $diagnostic=$_.ToString()
-  if ($diagnostic.Length -gt 4096) {{ $diagnostic=$diagnostic.Substring(0,4096) }}
+  if ($diagnostic.Length -gt 4096) {{
+    $length=4096
+    if ([char]::IsHighSurrogate($diagnostic[$length-1])) {{ $length-- }}
+    $diagnostic=$diagnostic.Substring(0,$length)
+  }}
+  $diagnostic=$diagnostic -replace "`r`n","`n" -replace "`r","`n"
   $diagnosticBytes=[Text.Encoding]::UTF8.GetByteCount($diagnostic)
-  Send-Record @{{type='diagnostic'; stream='stderr'; text=$diagnostic; line_count=1; byte_count=$diagnosticBytes; trailing_delimiter_bytes=0}}
+  $diagnosticLines=([regex]::Matches($diagnostic,"`n").Count + 1)
+  Send-Record @{{type='diagnostic'; stream='stderr'; text=$diagnostic; line_count=$diagnosticLines; byte_count=$diagnosticBytes; trailing_delimiter_bytes=0}}
   if ($script:nativeRc -eq $null) {{ $script:nativeRc=1 }}
 }}
 $rc=$script:nativeRc
@@ -341,12 +347,15 @@ def write_record(stream: BinaryIO, record: dict[str, object]) -> None:
 
 
 def _bounded_json_int(text: str) -> int:
-    if len(text.lstrip("-")) > 1024:
+    digits = len(text) - int(text.startswith("-"))
+    if digits > 1024:
         raise ValueError("JSON integer exceeds 1024 digits")
     return int(text)
 
 
 def _bounded_json_float(text: str) -> float:
+    if len(text) > 1024:
+        raise ValueError("JSON float exceeds 1024 characters")
     value = float(text)
     if not math.isfinite(value):
         raise ValueError("non-finite JSON number")
@@ -409,10 +418,31 @@ class SequenceParser:
                             invalid_unicode = True
                             break
                     elif isinstance(item, dict):
-                        stack.extend(item.keys())
-                        stack.extend(item.values())
+                        for key, child in item.items():
+                            if isinstance(key, str):
+                                try:
+                                    key.encode("utf-8")
+                                except UnicodeEncodeError:
+                                    invalid_unicode = True
+                                    break
+                            if isinstance(child, str):
+                                try:
+                                    child.encode("utf-8")
+                                except UnicodeEncodeError:
+                                    invalid_unicode = True
+                                    break
+                            elif isinstance(child, (dict, list)):
+                                stack.append(child)
                     elif isinstance(item, list):
-                        stack.extend(item)
+                        for child in item:
+                            if isinstance(child, str):
+                                try:
+                                    child.encode("utf-8")
+                                except UnicodeEncodeError:
+                                    invalid_unicode = True
+                                    break
+                            elif isinstance(child, (dict, list)):
+                                stack.append(child)
                 if invalid_unicode:
                     yield {"type": "protocol_error", "message": "JSON sequence record contains invalid Unicode"}
                 else:
