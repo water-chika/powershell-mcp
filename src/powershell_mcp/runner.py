@@ -7,6 +7,7 @@ import base64
 import contextlib
 import codecs
 import json
+import math
 import os
 import re
 import selectors
@@ -274,7 +275,9 @@ function Observe-Line([string]$line, [string]$stream, [bool]$hadDelimiter) {{
 try {{ {invoke}; Flush-Output }}
 catch {{
   Flush-Output
-  $diagnostic=$_.ToString(); $diagnosticBytes=[Text.Encoding]::UTF8.GetByteCount($diagnostic)
+  $diagnostic=$_.ToString()
+  if ($diagnostic.Length -gt 4096) {{ $diagnostic=$diagnostic.Substring(0,4096) }}
+  $diagnosticBytes=[Text.Encoding]::UTF8.GetByteCount($diagnostic)
   Send-Record @{{type='diagnostic'; stream='stderr'; text=$diagnostic; line_count=1; byte_count=$diagnosticBytes; trailing_delimiter_bytes=0}}
   if ($script:nativeRc -eq $null) {{ $script:nativeRc=1 }}
 }}
@@ -337,6 +340,23 @@ def write_record(stream: BinaryIO, record: dict[str, object]) -> None:
     stream.flush()
 
 
+def _bounded_json_int(text: str) -> int:
+    if len(text.lstrip("-")) > 1024:
+        raise ValueError("JSON integer exceeds 1024 digits")
+    return int(text)
+
+
+def _bounded_json_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("non-finite JSON number")
+    return value
+
+
+def _reject_json_constant(text: str) -> None:
+    raise ValueError(f"invalid JSON constant: {text}")
+
+
 class SequenceParser:
     """Incremental RFC 7464 parser with bounded framing diagnostics."""
 
@@ -370,12 +390,33 @@ class SequenceParser:
             raw = bytes(self.buffer[1:end])
             del self.buffer[: end + 1]
             try:
-                value = json.loads(raw)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                yield {"type": "protocol_error", "message": f"invalid JSON sequence record: {exc}"}
+                value = json.loads(raw, parse_int=_bounded_json_int,
+                                   parse_float=_bounded_json_float,
+                                   parse_constant=_reject_json_constant)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+                message = f"invalid JSON sequence record: {type(exc).__name__}: {exc}"
+                yield {"type": "protocol_error", "message": message[:1024]}
                 continue
             if isinstance(value, dict):
-                yield value
+                invalid_unicode = False
+                stack: list[object] = [value]
+                while stack:
+                    item = stack.pop()
+                    if isinstance(item, str):
+                        try:
+                            item.encode("utf-8")
+                        except UnicodeEncodeError:
+                            invalid_unicode = True
+                            break
+                    elif isinstance(item, dict):
+                        stack.extend(item.keys())
+                        stack.extend(item.values())
+                    elif isinstance(item, list):
+                        stack.extend(item)
+                if invalid_unicode:
+                    yield {"type": "protocol_error", "message": "JSON sequence record contains invalid Unicode"}
+                else:
+                    yield value
             else:
                 yield {"type": "protocol_error", "message": "JSON sequence record is not an object"}
 
@@ -430,7 +471,10 @@ def execute(
     selector = selectors.DefaultSelector()
     selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
     selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
-    parser = SequenceParser(maximum_record_bytes=min(max_bytes * 6 + 65536, _MAX_BYTES * 6 + 65536))
+    # JSON escaping can expand one accepted UTF-8 line by up to six times. Keep
+    # each record finite while allowing the configured command-output maximum.
+    parser = SequenceParser(maximum_record_bytes=min(max_bytes * 6 + 65536,
+                                                     _MAX_BYTES * 6 + 65536))
     request_deadline = time.monotonic() + timeout
     termination_deadline: float | None = None
     drain_deadline: float | None = None

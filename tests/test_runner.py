@@ -286,6 +286,13 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("protocol errors before timeout", records[-1]["message"])
         self.assertEqual(records[-1]["type"], "terminal")
 
+    def test_parser_converts_resource_errors_to_bounded_protocol_errors(self) -> None:
+        parser = SequenceParser(maximum_record_bytes=20000)
+        huge_integer = RS + b'{"value":' + (b'9' * 1025) + b'}\n'
+        records = list(parser.feed(huge_integer))
+        self.assertEqual(records[0]["type"], "protocol_error")
+        self.assertLessEqual(len(records[0]["message"]), 1024)
+
     def test_parser_bounds_and_reports_incomplete_records(self) -> None:
         parser = SequenceParser(maximum_record_bytes=8)
         errors = list(parser.feed(RS + b"123456789"))
