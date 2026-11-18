@@ -1,0 +1,3 @@
+# alias | OpenSSH destination/options | payload mode
+example-windows | developer@example.invalid | powershell
+forwarded       | -p 2222 developer@127.0.0.1 | powershell

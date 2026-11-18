@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+
+import io
+import os
+import sys
+import textwrap
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from powershell_mcp.runner import (Host, RS, SequenceParser, backend_main,
+                               build_remote_script, execute, launch_argv, resolve_target)
+
+
+def decode(data: bytes) -> list[dict]:
+    parser = SequenceParser()
+    records = list(parser.feed(data))
+    records.extend(parser.finish())
+    return records
+
+
+class ScriptTests(unittest.TestCase):
+    def test_child_stdin_is_disconnected(self) -> None:
+        status, records = self.run_helper(r'''
+            import json, sys
+            value = sys.stdin.read()
+            def record(item):
+                sys.stdout.buffer.write(b"\x1e" + json.dumps(item).encode() + b"\n")
+                sys.stdout.buffer.flush()
+            record({"type":"output", "source":"remote", "sequence":1,
+                    "stream":"stdout", "text":"eof" if value == "" else "unexpected"})
+            record({"type":"exit", "source":"remote", "sequence":2, "exit_code":0})
+        ''')
+        self.assertEqual(status, 0)
+        self.assertIn("eof", [record.get("text") for record in records])
+
+    def test_local_target_uses_direct_pwsh_without_shell(self) -> None:
+        with patch.dict(os.environ, {"POWERSHELL_MCP_PWSH": str(Path.home() / ".local/bin/pwsh")}):
+            target = resolve_target("local")
+        argv = launch_argv(target, "Write-Output ok")
+        self.assertEqual(argv[0], str((Path.home() / ".local/bin/pwsh").resolve()))
+        self.assertNotIn("sh", argv[:1])
+        self.assertIn("-EncodedCommand", argv)
+
+    def test_target_budgets_and_framed_exit_are_built_in(self) -> None:
+        script = build_remote_script('Write-Output "x"', "powershell", 12, 3456, "x y")
+        self.assertIn("$lineLimit=12", script)
+        self.assertIn("$byteLimit=3456", script)
+        self.assertIn("$regex.IsMatch($line)", script)
+        self.assertIn("type='exit'", script)
+        self.assertIn("[Console]::Out.Write([char]0x1e)", script)
+
+    def test_parser_accepts_fragmented_records(self) -> None:
+        parser = SequenceParser()
+        self.assertEqual(list(parser.feed(b"noise\x1e{\"type\":\"std"))[0]["type"], "protocol_error")
+        self.assertEqual(list(parser.feed(b"out\",\"text\":\"ok\"}\n")),
+                         [{"type": "stdout", "text": "ok"}])
+
+    def run_helper(self, body: str, *, timeout: float = 5) -> tuple[int, list[dict]]:
+        output = io.BytesIO()
+        argv = [sys.executable, "-c", textwrap.dedent(body)]
+        with patch("powershell_mcp.runner.launch_argv", return_value=argv):
+            status = execute(Host("test", "unused", "powershell"), "Write-Output ignored",
+                             mode="powershell", max_lines=40, max_bytes=65536,
+                             pattern=None, timeout=timeout, output=output)
+        return status, decode(output.getvalue())
+
+    def test_late_stderr_precedes_single_terminal(self) -> None:
+        status, records = self.run_helper(r'''
+            import json, sys, time
+            def record(value):
+                sys.stdout.buffer.write(b"\x1e" + json.dumps(value).encode() + b"\n")
+                sys.stdout.buffer.flush()
+            record({"type":"output", "source":"remote", "sequence":1,
+                    "stream":"stdout", "text":"ok"})
+            record({"type":"exit", "source":"remote", "sequence":2, "exit_code":0})
+            time.sleep(0.05)
+            sys.stderr.write("late diagnostic\n"); sys.stderr.flush()
+        ''')
+        self.assertEqual(status, 0)
+        self.assertEqual(sum(record["type"] == "terminal" for record in records), 1)
+        self.assertEqual(records[-1]["type"], "terminal")
+        self.assertEqual([record["type"] for record in records],
+                         ["start", "output", "diagnostic", "terminal"])
+        self.assertEqual([record["sequence"] for record in records], list(range(1, 5)))
+
+    def test_duplicate_missing_and_trailing_records_are_protocol_failures(self) -> None:
+        cases = {
+            "missing": 'record({"type":"output", "text":"x"})',
+            "duplicate": 'record({"type":"exit", "exit_code":0}); record({"type":"exit", "exit_code":0})',
+            "trailing": 'record({"type":"exit", "exit_code":0}); record({"type":"output", "text":"late"})',
+            "incomplete": 'sys.stdout.buffer.write(b"\\x1e{\\\"type\\\":\\\"exit\\\""); sys.stdout.buffer.flush()',
+            "bad-exit-type": 'record({"type":"exit", "exit_code":"0"})',
+            "bad-counter": 'record({"type":"exit", "exit_code":0, "observed_lines":false})',
+            "reserved-terminal": 'record({"type":"terminal", "exit_code":0}); record({"type":"exit", "exit_code":0})',
+            "unknown-type": 'record({"type":"mystery"}); record({"type":"exit", "exit_code":0})',
+            "bad-sequence": 'record({"type":"output", "source":"remote", "sequence":2, "text":"x"}); record({"type":"exit", "source":"remote", "sequence":1, "exit_code":0})',
+        }
+        for name, statements in cases.items():
+            with self.subTest(name=name):
+                status, records = self.run_helper(f'''
+                    import json, sys
+                    def record(value):
+                        sys.stdout.buffer.write(b"\\x1e" + json.dumps(value).encode() + b"\\n")
+                        sys.stdout.buffer.flush()
+                    {statements}
+                ''')
+                self.assertNotEqual(status, 0)
+                self.assertEqual(sum(record["type"] == "terminal" for record in records), 1)
+                self.assertEqual(records[-1]["type"], "terminal")
+                self.assertEqual(records[-1]["failure"], "protocol")
+
+    def test_timeout_drains_shutdown_output_before_terminal(self) -> None:
+        status, records = self.run_helper(r'''
+            import json, signal, sys, time
+            def record(value):
+                sys.stdout.buffer.write(b"\x1e" + json.dumps(value).encode() + b"\n")
+                sys.stdout.buffer.flush()
+            def stop(signum, frame):
+                record({"type":"output", "stream":"stdout", "text":"shutdown output"})
+                sys.stderr.write("shutdown diagnostic\n"); sys.stderr.flush()
+                raise SystemExit(0)
+            signal.signal(signal.SIGTERM, stop)
+            while True: time.sleep(0.05)
+        ''', timeout=0.1)
+        self.assertEqual(status, 124)
+        self.assertEqual(records[-1]["type"], "terminal")
+        self.assertEqual(records[-1]["failure"], "timeout")
+        self.assertEqual(sum(record["type"] == "terminal" for record in records), 1)
+        self.assertIn("shutdown output", [record.get("text") for record in records])
+        self.assertIn("shutdown diagnostic", [record.get("text") for record in records])
+
+    def test_nonzero_transport_status_overrides_remote_success(self) -> None:
+        status, records = self.run_helper(r'''
+            import json, sys
+            value = {"type":"exit", "source":"remote", "sequence":1, "exit_code":0}
+            sys.stdout.buffer.write(b"\x1e" + json.dumps(value).encode() + b"\n")
+            sys.stdout.buffer.flush()
+            raise SystemExit(255)
+        ''')
+        self.assertNotEqual(status, 0)
+        self.assertEqual(records[-1]["failure"], "protocol")
+        self.assertIn("SSH transport exited with status 255", records[-1]["message"])
+
+    def test_timeout_preserves_protocol_error_details(self) -> None:
+        status, records = self.run_helper(r'''
+            import signal, sys, time
+            signal.signal(signal.SIGTERM, lambda signum, frame: (_ for _ in ()).throw(SystemExit(0)))
+            sys.stdout.buffer.write(b"unframed bytes")
+            sys.stdout.buffer.flush()
+            while True: time.sleep(0.05)
+        ''', timeout=0.1)
+        self.assertEqual(status, 124)
+        self.assertEqual(records[-1]["failure"], "timeout")
+        self.assertIn("protocol errors before timeout", records[-1]["message"])
+        self.assertEqual(records[-1]["type"], "terminal")
+
+    def test_parser_bounds_and_reports_incomplete_records(self) -> None:
+        parser = SequenceParser(maximum_record_bytes=8)
+        errors = list(parser.feed(RS + b"123456789"))
+        self.assertEqual(errors[0]["type"], "protocol_error")
+        parser = SequenceParser(maximum_record_bytes=8)
+        errors = list(parser.feed(RS + b"123456789\n"))
+        self.assertEqual(errors[0]["type"], "protocol_error")
+        parser = SequenceParser()
+        list(parser.feed(RS + b'{"type":"exit"'))
+        self.assertEqual(list(parser.finish())[0]["type"], "protocol_error")
+
+    def test_stdin_script_and_structured_request_failure(self) -> None:
+        output = io.BytesIO()
+        fake_stdout = type("Stdout", (), {"buffer": output})()
+        with patch("sys.stdout", fake_stdout), patch("sys.stdin", io.StringIO("Write-Output ok")), \
+             patch.dict(os.environ, {"POWERSHELL_MCP_DRYRUN": "1", "POWERSHELL_MCP_REGISTRY": "/nonexistent"}, clear=False):
+            self.assertEqual(backend_main(["--script-stdin", "host"]), 0)
+        request = decode(output.getvalue())[0]
+        self.assertEqual(request["type"], "request")
+        self.assertIn("V3JpdGUtT3V0cHV0IG9r", request["remote_script"])
+
+        output = io.BytesIO()
+        fake_stdout = type("Stdout", (), {"buffer": output})()
+        with patch("sys.stdout", fake_stdout), patch("sys.stdin", io.StringIO("")):
+            self.assertEqual(backend_main(["--script-stdin", "host"]), 2)
+        self.assertEqual(decode(output.getvalue())[0]["type"], "request_error")
+
+
+if __name__ == "__main__":
+    unittest.main()

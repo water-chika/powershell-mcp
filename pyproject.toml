@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "powershell-mcp"
+version = "0.1.0"
+description = "Bounded PowerShell MCP for explicit local and registered SSH targets"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+dependencies = ["mcp>=2.3,<3"]
+keywords = ["mcp", "powershell", "ssh", "automation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.scripts]
+powershell-mcp = "powershell_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/powershell_mcp"]
