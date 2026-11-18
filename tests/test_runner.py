@@ -123,19 +123,18 @@ class ScriptTests(unittest.TestCase):
                 self.assertEqual(records[-1]["failure"], "protocol")
 
     def test_real_powershell_preserves_newline_free_and_blank_lines(self) -> None:
-        from powershell_mcp.server import powershell_run
-        no_newline = powershell_run("local", "[Console]::Out.Write('abcdefghij')")
+        from powershell_mcp.server import public_result, run_target
+        no_newline = public_result(run_target("local", "[Console]::Out.Write('abcdefghij')", 40, 65536, None, 120))
         self.assertEqual(no_newline["output"], "abcdefghij")
-        blank = powershell_run("local", "Write-Output ''; Write-Output x", include_raw_records=True)
+        blank = public_result(run_target("local", "Write-Output ''; Write-Output x", 40, 65536, None, 120), True)
         texts = [record["text"] for record in blank["records"] if record.get("type") == "output"]
         self.assertEqual(texts, ["\nx"])
 
     def test_oversized_newline_free_line_is_fully_suppressed(self) -> None:
-        from powershell_mcp.server import powershell_run
-        result = powershell_run(
-            "local", "[Console]::Out.Write('x' * 10000)", max_bytes=5000,
-            include_raw_records=True,
-        )
+        from powershell_mcp.server import public_result, run_target
+        result = public_result(run_target(
+            "local", "[Console]::Out.Write('x' * 10000)", 40, 5000, None, 120
+        ), True)
         self.assertEqual(result["output"], "")
         terminal = result["records"][-1]
         self.assertEqual(terminal["observed_lines"], 1)
@@ -144,15 +143,27 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(terminal["byte_suppressed_lines"], 1)
         self.assertEqual(terminal["byte_suppressed_bytes"], 10000)
 
+    def test_powershell_error_policy_follows_script_preferences(self) -> None:
+        from powershell_mcp.server import public_result, run_target
+        continued = public_result(run_target("local", "Write-Error bad; Write-Output x", 40, 65536, None, 120))
+        self.assertEqual(continued["exit_code"], 0)
+        self.assertIn("x", continued["output"])
+        stopped = public_result(run_target(
+            "local", "$ErrorActionPreference='Stop'; Write-Error bad; Write-Output unreachable", 40, 65536, None, 120
+        ))
+        self.assertEqual(stopped["exit_code"], 1)
+        self.assertEqual(stopped["failure"], "remote_exit")
+        self.assertNotIn("unreachable", stopped["output"])
+
     def test_real_powershell_preserves_stderr_before_later_stdout(self) -> None:
-        from powershell_mcp.server import powershell_run
-        result = powershell_run(
-            "local",
-            "Write-Error bad; Start-Sleep -Milliseconds 50; Write-Output x",
-            include_raw_records=True,
-        )
+        from powershell_mcp.server import public_result, run_target
+        result = public_result(run_target(
+            "local", "[Console]::Error.WriteLine('bad'); Start-Sleep -Milliseconds 50; Write-Output x",
+            40, 65536, None, 120
+        ), True)
         streams = [record["stream"] for record in result["records"] if record.get("type") == "output"]
         self.assertEqual(streams, ["stderr", "stdout"])
+        self.assertEqual(result["exit_code"], 0)
 
     def test_timeout_drains_shutdown_output_before_terminal(self) -> None:
         status, records = self.run_helper(r'''
@@ -175,7 +186,7 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(records[-1]["type"], "terminal")
         self.assertEqual(records[-1]["failure"], "timeout")
         self.assertEqual(sum(record["type"] == "terminal" for record in records), 1)
-        self.assertIn("shutdown output", [record.get("text") for record in records])
+        self.assertNotIn("shutdown output", [record.get("text") for record in records])
         self.assertIn("shutdown diagnostic", [record.get("text") for record in records])
 
     def test_nonzero_transport_status_overrides_remote_success(self) -> None:
@@ -214,6 +225,31 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(records[-1]["exit_code"], 0)
         self.assertEqual(sum(record.get("type") == "output" for record in records), 500)
+
+    def test_timeout_discards_shutdown_stdout(self) -> None:
+        output = io.BytesIO()
+        body = r'''
+            import json, signal, sys, time
+            def stop(signum, frame):
+                for sequence in range(1, 20001):
+                    value = {"type":"output", "source":"remote", "sequence":sequence,
+                             "stream":"stdout", "text":"x", "line_count":1,
+                             "byte_count":2, "trailing_delimiter_bytes":1}
+                    sys.stdout.buffer.write(b"\x1e" + json.dumps(value).encode() + b"\n")
+                sys.stdout.buffer.flush()
+                raise SystemExit(0)
+            signal.signal(signal.SIGTERM, stop)
+            while True: time.sleep(0.05)
+        '''
+        argv = [sys.executable, "-c", textwrap.dedent(body)]
+        with patch("powershell_mcp.runner.launch_argv", return_value=argv):
+            status = execute(Host("test", "unused", "powershell"), "ignored", mode="powershell",
+                             max_lines=0, max_bytes=1, pattern=None, timeout=0.1, output=output)
+        records = decode(output.getvalue())
+        self.assertEqual(status, 124)
+        self.assertEqual(records[-1]["failure"], "timeout")
+        self.assertFalse(any(record.get("type") == "output" for record in records))
+        self.assertLess(len(output.getvalue()), 65536)
 
     def test_receive_budget_is_distinct_from_timeout(self) -> None:
         output = io.BytesIO()

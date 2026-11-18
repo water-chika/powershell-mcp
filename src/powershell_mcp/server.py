@@ -9,6 +9,7 @@ from typing import NotRequired, TypedDict, cast
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp_types import CallToolResult, TextContent
 
 from .runner import SequenceParser, UsageError, execute, load_registry, resolve_target
 
@@ -78,14 +79,14 @@ def load_hosts(path: Path | None = None) -> tuple[str, ...]:
     source = path or registry_path()
     try:
         return tuple(load_registry(source))
-    except (OSError, UsageError) as exc:
+    except (OSError, UnicodeError, UsageError) as exc:
         raise ToolError(f"cannot read wsh host registry: {exc}") from exc
 
 
 def require_target(target: str) -> str:
     try:
         resolve_target(target, registry_path())
-    except UsageError as exc:
+    except (OSError, UnicodeError, UsageError) as exc:
         raise ToolError(str(exc)) from exc
     return target
 
@@ -101,7 +102,7 @@ def run_target(target: str, script: str, max_lines: int, max_bytes: int,
                filter: str | None, timeout_seconds: int) -> CommandResult:
     try:
         resolved = resolve_target(target, registry_path())
-    except UsageError as exc:
+    except (OSError, UnicodeError, UsageError) as exc:
         raise ToolError(str(exc)) from exc
     framed = io.BytesIO()
     status = execute(resolved, script, mode="powershell", max_lines=max_lines,
@@ -127,7 +128,13 @@ def command_result_from_records(records: list[dict[str, object]], target: str,
     if protocol_records and not isinstance(terminal.get("message"), str):
         raise ToolError("structured failure omitted preceding protocol-error details")
     ordered = [record for record in records if record.get("type") in ("output", "diagnostic")]
-    output_text = "\n".join(str(record.get("text", "")) for record in ordered)
+    output_parts: list[str] = []
+    for record in ordered:
+        output_parts.append(str(record.get("text", "")))
+        delimiters = record.get("trailing_delimiter_bytes", 0)
+        if isinstance(delimiters, int) and not isinstance(delimiters, bool) and delimiters > 0:
+            output_parts.append("\n" * delimiters)
+    output_text = "".join(output_parts)
     result = CommandResult(host=target, output=output_text, records=records)
     result.output_complete = terminal.get("output_complete") is True
     exit_code = terminal.get("exit_code")
@@ -193,6 +200,22 @@ def public_result(result: CommandResult, include_raw_records: bool = False) -> P
     return cast(PublicCommandResult, response)
 
 
+def display_result(result: CommandResult, include_raw_records: bool = False) -> CallToolResult:
+    structured = public_result(result, include_raw_records)
+    text = result.output
+    if result.exit_code not in (None, 0):
+        suffix = f"Process exited with code {result.exit_code}"
+        text = f"{text}{'' if not text or text.endswith(chr(10)) else chr(10)}{suffix}"
+    elif result.failure is not None and result.exit_code is None:
+        suffix = f"PowerShell execution failed: {result.failure}"
+        text = f"{text}{'' if not text or text.endswith(chr(10)) else chr(10)}{suffix}"
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structured_content=structured,
+        is_error=False,
+    )
+
+
 mcp = MCPServer("powershell", instructions="Run bounded PowerShell on explicit local or registered SSH targets; command failures are structured results, not tool errors.")
 
 @mcp.tool(structured_output=True)
@@ -203,16 +226,16 @@ def list_powershell_targets() -> dict[str, list[dict[str, str]]]:
     return {"targets": targets}
 
 
-@mcp.tool(structured_output=True)
-def powershell_status(target: str, include_raw_records: bool = False) -> PublicCommandResult:
+@mcp.tool()
+def powershell_status(target: str, include_raw_records: bool = False) -> CallToolResult:
     """Check an explicit local or registered SSH PowerShell target."""
     require_target(target)
     script = "$PSVersionTable.PSVersion.ToString(); [Environment]::MachineName"
     result = run_target(target, script, 2, 4096, None, 30)
-    return public_result(result, include_raw_records)
+    return display_result(result, include_raw_records)
 
 
-@mcp.tool(structured_output=True)
+@mcp.tool()
 def powershell_run(target: str, script: str, max_lines: int = 40,
                    max_bytes: int = 65536, filter: str | None = None,
                    timeout_seconds: int = 120,
@@ -224,8 +247,8 @@ def powershell_run(target: str, script: str, max_lines: int = 40,
     if not 1 <= max_bytes <= _MAX_BYTES: raise ToolError(f"max_bytes must be between 1 and {_MAX_BYTES}")
     if not 1 <= timeout_seconds <= _MAX_TIMEOUT_SECONDS: raise ToolError(f"timeout_seconds must be between 1 and {_MAX_TIMEOUT_SECONDS}")
     if filter == "": raise ToolError("filter must not be empty when provided")
-    return public_result(run_target(target, script, max_lines, max_bytes, filter, timeout_seconds),
-                         include_raw_records)
+    return display_result(run_target(target, script, max_lines, max_bytes, filter, timeout_seconds),
+                          include_raw_records)
 
 
 

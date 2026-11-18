@@ -11,7 +11,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.server.mcpserver.exceptions import ToolError
 
-from powershell_mcp.server import load_hosts
+from powershell_mcp.server import command_result_from_records, load_hosts
 
 RS = b"\x1e"
 
@@ -28,6 +28,18 @@ class RegistryTests(unittest.TestCase):
             registry.write_text("bad row\n")
             with self.assertRaisesRegex(ToolError, "malformed"):
                 load_hosts(registry)
+            registry.write_bytes(b"\xff")
+            with self.assertRaisesRegex(ToolError, "cannot read"):
+                load_hosts(registry)
+
+    def test_output_reconstruction_uses_declared_delimiters(self) -> None:
+        records = [
+            {"type": "output", "text": "a", "trailing_delimiter_bytes": 0},
+            {"type": "output", "text": "b", "trailing_delimiter_bytes": 1},
+            {"type": "terminal", "exit_code": 0, "output_complete": True},
+        ]
+        result = command_result_from_records(records, "local")
+        self.assertEqual(result.output, "ab\n")
 
 
 class ProtocolTests(unittest.TestCase):
@@ -52,8 +64,9 @@ class ProtocolTests(unittest.TestCase):
                             self.assertIn("target", tool.input_schema.get("required", []))
                         self.assertEqual(flag["type"], "boolean")
                         self.assertFalse(flag["default"])
-                        self.assertIn("records", tool.output_schema["properties"])
-                        self.assertNotIn("records", tool.output_schema.get("required", []))
+                        if tool.output_schema is not None:
+                            self.assertIn("records", tool.output_schema["properties"])
+                            self.assertNotIn("records", tool.output_schema.get("required", []))
 
                     listed_targets = await session.call_tool("list_powershell_targets", {})
                     self.assertEqual(listed_targets.structured_content, {"targets": [
@@ -67,7 +80,13 @@ class ProtocolTests(unittest.TestCase):
                     local = await session.call_tool(
                         "powershell_run", {"target": "local", "script": "Write-Output local-ok"}
                     )
-                    self.assertEqual(local.structured_content, {"output": "local-ok", "exit_code": 0})
+                    self.assertEqual(local.structured_content, {"output": "local-ok\n", "exit_code": 0})
+                    self.assertEqual(local.content[0].text, "local-ok\n")
+                    failed = await session.call_tool(
+                        "powershell_run", {"target": "local", "script": "Write-Output bad; exit 7"}
+                    )
+                    self.assertEqual(failed.content[0].text, "bad\nProcess exited with code 7")
+                    self.assertEqual(failed.structured_content["exit_code"], 7)
 
 
 if __name__ == "__main__":

@@ -241,8 +241,9 @@ function Observe-Text([string]$text, [string]$stream, [bool]$final) {{
 function Observe-Line([string]$line, [string]$stream, [bool]$hadDelimiter) {{
       if ($stream -eq 'stderr') {{ $script:hadError=$true }}
       $bytes=[Text.Encoding]::UTF8.GetByteCount($line) + $(if ($hadDelimiter) {{1}} else {{0}})
+      try {{ $matched=($null -eq $regex) -or $regex.IsMatch($line) }}
+      catch [Text.RegularExpressions.RegexMatchTimeoutException] {{ throw 'filter regular expression timed out' }}
       $script:seenLines++; $script:seenBytes += $bytes
-      $matched=($null -eq $regex) -or $regex.IsMatch($line)
       $withinLines=($lineLimit -eq 0) -or ($script:sentLines -lt $lineLimit)
       $withinBytes=($script:sentBytes + $bytes -le $byteLimit)
       if (-not $matched) {{ $script:filterLines++; $script:filterBytes += $bytes }}
@@ -259,7 +260,12 @@ function Observe-Line([string]$line, [string]$stream, [bool]$hadDelimiter) {{
       }}
 }}
 try {{ {invoke}; Flush-Output }}
-catch {{ Flush-Output; Observe-Line $_.ToString() 'stderr' $false; Flush-Output; if ($script:nativeRc -eq $null) {{ $script:nativeRc=1 }} }}
+catch {{
+  Flush-Output
+  $diagnostic=$_.ToString(); $diagnosticBytes=[Text.Encoding]::UTF8.GetByteCount($diagnostic)
+  Send-Record @{{type='diagnostic'; stream='stderr'; text=$diagnostic; line_count=1; byte_count=$diagnosticBytes; trailing_delimiter_bytes=0}}
+  if ($script:nativeRc -eq $null) {{ $script:nativeRc=1 }}
+}}
 $rc=$script:nativeRc
 if ($rc -eq $null) {{ $rc=if ($script:hadError) {{1}} else {{0}} }}
 Send-Record @{{type='exit'; exit_code=[int64]$rc; observed_lines=$script:seenLines; observed_bytes=$script:seenBytes; emitted_lines=$script:sentLines; emitted_bytes=$script:sentBytes; filter_suppressed_lines=$script:filterLines; filter_suppressed_bytes=$script:filterBytes; line_suppressed_lines=$script:lineLines; line_suppressed_bytes=$script:lineBytes; byte_suppressed_lines=$script:byteLines; byte_suppressed_bytes=$script:byteBytes}}
@@ -456,10 +462,16 @@ def execute(
                 protocol_diagnostics_emitted += 1
                 protocol_diagnostic_bytes += encoded_size
             return
-        if record_type not in ("output", "exit"):
+        if record_type == "diagnostic":
+            stream = record.get("stream")
+            text = record.get("text")
+            if stream not in ("stdout", "stderr") or not isinstance(text, str):
+                add_protocol_error("invalid diagnostic record fields")
+                return
+        elif record_type not in ("output", "exit"):
             add_protocol_error(f"unexpected remote record type {record_type!r}")
             return
-        if record_type == "output":
+        if record_type in ("output", "diagnostic"):
             stream = record.get("stream")
             text = record.get("text")
             line_count = record.get("line_count")
@@ -469,7 +481,8 @@ def execute(
                 stream in ("stdout", "stderr") and isinstance(text, str) and
                 isinstance(line_count, int) and not isinstance(line_count, bool) and line_count >= 1 and
                 isinstance(byte_count, int) and not isinstance(byte_count, bool) and byte_count >= 0 and
-                isinstance(trailing_delimiter_bytes, int) and not isinstance(trailing_delimiter_bytes, bool) and trailing_delimiter_bytes >= 0
+                isinstance(trailing_delimiter_bytes, int) and not isinstance(trailing_delimiter_bytes, bool) and
+                trailing_delimiter_bytes >= 0
             )
             if fields_valid:
                 text_value = cast(str, text)
@@ -481,17 +494,22 @@ def execute(
                 fields_valid = (lines_value == expected_lines and
                                 delimiters_value in (0, 1) and bytes_value == expected_bytes)
             if not fields_valid:
-                add_protocol_error("invalid output record fields")
+                add_protocol_error(f"invalid {record_type} record fields")
                 return
         sequence = record.get("sequence")
+        record_valid = True
         if (not isinstance(sequence, int) or isinstance(sequence, bool) or
                 sequence != expected_remote_sequence):
             add_protocol_error(
                 f"remote sequence mismatch: expected {expected_remote_sequence}, received {sequence!r}")
+            record_valid = False
         else:
             expected_remote_sequence += 1
         if record.get("source") != "remote":
             add_protocol_error(f"invalid remote record source {record.get('source')!r}")
+            record_valid = False
+        if not record_valid:
+            return
         if record_type == "exit":
             remote_exit_count += 1
             saw_remote_exit = True
@@ -501,8 +519,9 @@ def execute(
         if saw_remote_exit:
             add_protocol_error(f"remote {record_type!r} record followed exit")
             return
-        received_output_lines += cast(int, record["line_count"])
-        received_output_bytes += cast(int, record["byte_count"])
+        if record_type == "output":
+            received_output_lines += cast(int, record["line_count"])
+            received_output_bytes += cast(int, record["byte_count"])
         emit(record)
 
     try:
@@ -562,7 +581,7 @@ def execute(
                         stderr_text = emit_stderr_lines(stderr_text, final=True)
                     continue
                 if key.data == "stdout":
-                    if cancellation_reason == "receive_budget":
+                    if cancellation_reason is not None:
                         continue
                     raw_stdout_bytes += len(data)
                     if raw_stdout_bytes > receive_limit and cancellation_reason is None:
