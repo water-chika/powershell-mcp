@@ -48,7 +48,7 @@ class CommandResult:
 
 class PublicCommandResult(TypedDict):
     output: str
-    exit_code: int | None
+    exit_code: NotRequired[int | None]
     host: NotRequired[str]
     ok: NotRequired[bool]
     output_complete: NotRequired[bool]
@@ -161,10 +161,9 @@ def command_result_from_records(records: list[dict[str, object]], target: str,
 
 
 def public_result(result: CommandResult, include_raw_records: bool = False) -> PublicCommandResult:
-    response: dict[str, object] = {
-        "output": result.output,
-        "exit_code": result.exit_code,
-    }
+    response: dict[str, object] = {"output": result.output}
+    if result.exit_code != 0:
+        response["exit_code"] = result.exit_code
     if not result.output_complete:
         response["output_complete"] = False
     if result.transport_exit_code is not None:

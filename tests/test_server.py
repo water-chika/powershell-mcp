@@ -80,7 +80,7 @@ class ProtocolTests(unittest.TestCase):
                     local = await session.call_tool(
                         "powershell_run", {"target": "local", "script": "Write-Output local-ok"}
                     )
-                    self.assertEqual(local.structured_content, {"output": "local-ok\n", "exit_code": 0})
+                    self.assertEqual(local.structured_content, {"output": "local-ok\n"})
                     self.assertEqual(local.content[0].text, "local-ok\n")
                     failed = await session.call_tool(
                         "powershell_run", {"target": "local", "script": "Write-Output bad; exit 7"}

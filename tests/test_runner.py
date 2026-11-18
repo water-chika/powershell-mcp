@@ -146,7 +146,7 @@ class ScriptTests(unittest.TestCase):
     def test_powershell_error_policy_follows_script_preferences(self) -> None:
         from powershell_mcp.server import public_result, run_target
         continued = public_result(run_target("local", "Write-Error bad; Write-Output x", 40, 65536, None, 120))
-        self.assertEqual(continued["exit_code"], 0)
+        self.assertNotIn("exit_code", continued)
         self.assertIn("x", continued["output"])
         stopped = public_result(run_target(
             "local", "$ErrorActionPreference='Stop'; Write-Error bad; Write-Output unreachable", 40, 65536, None, 120
@@ -163,7 +163,7 @@ class ScriptTests(unittest.TestCase):
         ), True)
         streams = [record["stream"] for record in result["records"] if record.get("type") == "output"]
         self.assertEqual(streams, ["stderr", "stdout"])
-        self.assertEqual(result["exit_code"], 0)
+        self.assertNotIn("exit_code", result)
 
     def test_timeout_drains_shutdown_output_before_terminal(self) -> None:
         status, records = self.run_helper(r'''
