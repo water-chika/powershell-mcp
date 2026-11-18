@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import codecs
 import json
 import os
@@ -40,6 +41,7 @@ class Host:
     spec: str
     mode: str = "powershell"
     transport: str = "ssh"
+    argv: tuple[str, ...] = ()
 
 
 def registry_path() -> Path:
@@ -68,9 +70,18 @@ def load_registry(path: Path | None = None) -> dict[str, Host]:
             raise UsageError(f"invalid wsh host alias on line {number}")
         if alias in result:
             raise UsageError(f"duplicate wsh host alias '{alias}'")
+        import shlex
+        try:
+            parsed_spec = shlex.split(spec)
+        except ValueError as exc:
+            raise UsageError(f"invalid SSH target arguments for alias '{alias}'") from exc
+        if not parsed_spec:
+            raise UsageError(f"empty SSH target arguments for alias '{alias}'")
+        if any("\x00" in argument for argument in parsed_spec):
+            raise UsageError(f"invalid NUL in SSH target arguments for alias '{alias}'")
         if mode != "powershell":
             raise UsageError(f"bad payload language '{mode}' for host '{alias}' (expected powershell)")
-        result[alias] = Host(alias, spec, mode)
+        result[alias] = Host(alias, spec, mode, "ssh", tuple(parsed_spec))
     return result
 
 
@@ -80,7 +91,7 @@ def resolve_host(alias: str, *, registered_only: bool = False) -> Host:
         return hosts[alias]
     if registered_only:
         raise UsageError(f"unknown wsh host alias '{alias}'")
-    return Host(alias, alias, "powershell")
+    return Host(alias, alias, "powershell", "ssh", (alias,))
 
 
 def resolve_target(target: str, path: Path | None = None) -> Host:
@@ -147,9 +158,10 @@ $psi.ArgumentList.Add('-OutputFormat'); $psi.ArgumentList.Add('Text')
 $psi.ArgumentList.Add('-EncodedCommand'); $psi.ArgumentList.Add($encoded)
 $child=[Diagnostics.Process]::new(); $child.StartInfo=$psi
 if (-not $child.Start()) {{ throw 'failed to start child PowerShell' }}
-$outBuffer=[char[]]::new(4096); $errBuffer=[char[]]::new(4096)
-$outTask=$child.StandardOutput.ReadAsync($outBuffer,0,$outBuffer.Length); $errTask=$child.StandardError.ReadAsync($errBuffer,0,$errBuffer.Length)
 try {{
+  Send-Record @{{type='process'; pid=$child.Id; started=$child.StartTime.ToUniversalTime().ToFileTimeUtc()}}
+  $outBuffer=[char[]]::new(4096); $errBuffer=[char[]]::new(4096)
+  $outTask=$child.StandardOutput.ReadAsync($outBuffer,0,$outBuffer.Length); $errTask=$child.StandardError.ReadAsync($errBuffer,0,$errBuffer.Length)
   while (($null -ne $outTask) -or ($null -ne $errTask)) {{
     $tasks=[Collections.Generic.List[Threading.Tasks.Task[int]]]::new()
     if ($null -ne $outTask) {{ $tasks.Add($outTask) }}; if ($null -ne $errTask) {{ $tasks.Add($errTask) }}
@@ -274,19 +286,43 @@ exit [int]$rc
 
 
 def ssh_argv(host: Host, remote_script: str) -> list[str]:
-    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "wsh"
-    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
-    import hashlib
-    control = runtime / hashlib.sha256(host.spec.encode()).hexdigest()[:32]
     opts = [
         "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-        "-o", "ConnectTimeout=15", "-o", "ControlMaster=auto",
-        "-o", f"ControlPath={control}", "-o", f"ControlPersist={os.environ.get('POWERSHELL_MCP_SSH_PERSIST', '600')}",
+        "-o", "ConnectTimeout=15", "-o", "ControlMaster=no",
     ]
     # specs intentionally support the same shell-like host registry as legacy wsh.
-    import shlex
-    return ["ssh", *opts, *shlex.split(host.spec),
+    destination = list(host.argv)
+    if not destination:
+        import shlex
+        try:
+            destination = shlex.split(host.spec)
+        except ValueError as exc:
+            raise UsageError(f"invalid SSH target arguments for alias '{host.alias}'") from exc
+    if not destination:
+        raise UsageError(f"empty SSH target arguments for alias '{host.alias}'")
+    return ["ssh", *opts, *destination,
             f"pwsh.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {_ps_encoded(remote_script)}"]
+
+
+def cancel_remote_process(host: Host, process_id: int, started_filetime: int) -> bool:
+    if host.transport != "ssh":
+        return True
+    command = (
+        "$p=Get-Process -Id " + str(process_id) + " -ErrorAction SilentlyContinue; "
+        "if($null -eq $p){exit 0}; "
+        "$started=$p.StartTime.ToUniversalTime().ToFileTimeUtc(); "
+        "if($started -ne " + str(started_filetime) + "){exit 3}; "
+        "taskkill.exe /PID " + str(process_id) + " /T /F | Out-Null; exit $LASTEXITCODE"
+    )
+    try:
+        completed = subprocess.run(
+            ssh_argv(host, command), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5, check=False,
+        )
+        return completed.returncode == 0
+    except (OSError, subprocess.TimeoutExpired, UsageError):
+        return False
 
 
 def launch_argv(host: Host, remote_script: str) -> list[str]:
@@ -384,7 +420,7 @@ def execute(
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, start_new_session=True)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         emit({"type": "terminal", "failure": "transport_start", "message": str(exc),
               "exit_code": None, "transport_exit_code": 127, "output_complete": False,
               "duration_ms": round((time.monotonic() - started) * 1000)})
@@ -394,12 +430,16 @@ def execute(
     selector = selectors.DefaultSelector()
     selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
     selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
-    parser = SequenceParser(maximum_record_bytes=max(_MAX_BYTES * 6 + 65536, max_bytes * 6 + 65536))
+    parser = SequenceParser(maximum_record_bytes=min(max_bytes * 6 + 65536, _MAX_BYTES * 6 + 65536))
     request_deadline = time.monotonic() + timeout
     termination_deadline: float | None = None
     drain_deadline: float | None = None
     remote_exit_count = 0
     pending_exit: dict[str, object] | None = None
+    remote_process_id: int | None = None
+    remote_process_started: int | None = None
+    process_record_seen = False
+    saw_remote_payload = False
     saw_remote_exit = False
     expected_remote_sequence = 1
     protocol_errors: list[str] = []
@@ -408,32 +448,56 @@ def execute(
     stderr_text = ""
     diagnostic_lines = 0
     diagnostic_bytes = 0
+    remote_diagnostic_lines = 0
+    remote_diagnostic_bytes = 0
     diagnostic_suppressed = 0
+    diagnostic_suppressed_bytes = 0
     raw_stdout_bytes = 0
-    maximum_output_records = min(max_lines if max_lines else max_bytes, max_bytes)
-    receive_limit = max_bytes * 6 + maximum_output_records * 256 + 65536
+    raw_stderr_bytes = 0
+    # One-byte lines alternating streams can force one JSON record per output
+    # byte. Allow bounded worst-case framing overhead without trusting the peer.
+    # A one-byte logical line can require a standalone JSON record. Sequence
+    # numbers and metadata make the worst-case framing overhead roughly 160x.
+    receive_limit = min(max_bytes * 192 + 65536, 192 * 1024 * 1024)
     cancellation_reason: str | None = None
-
+    remote_cancellation_confirmed = host.transport == "local"
     def emit_stderr_lines(text: str, *, final: bool = False) -> str:
-        nonlocal diagnostic_lines, diagnostic_bytes, diagnostic_suppressed
+        nonlocal diagnostic_lines, diagnostic_bytes, diagnostic_suppressed, diagnostic_suppressed_bytes
         lines = text.splitlines(keepends=True)
+        partial_was_truncated = False
         if not final and lines and not lines[-1].endswith(("\n", "\r")):
             remainder = lines.pop()
             if len(remainder) > 4096:
+                diagnostic_suppressed += 1
+                diagnostic_suppressed_bytes += len(remainder[4096:].encode("utf-8"))
                 lines.append(remainder[:4096])
                 remainder = ""
+                partial_was_truncated = True
         else:
             remainder = ""
         for line in lines:
-            clean = line.rstrip("\r\n")[:4096]
+            had_delimiter = line.endswith(("\n", "\r"))
+            original = line.rstrip("\r\n")
+            if _BANNER.match(original):
+                continue
+            clean = original[:4096]
             encoded_bytes = len(clean.encode("utf-8"))
+            truncated_bytes = len(original.encode("utf-8")) - encoded_bytes
+            line_was_truncated = partial_was_truncated or truncated_bytes > 0
+            if truncated_bytes > 0:
+                diagnostic_suppressed += 1
+                diagnostic_suppressed_bytes += truncated_bytes
             if clean and not _BANNER.match(clean):
-                if diagnostic_lines < 40 and diagnostic_bytes + encoded_bytes <= 65536:
-                    emit({"type": "diagnostic", "stream": "stderr", "text": clean})
+                if (diagnostic_lines < 40 and diagnostic_bytes + encoded_bytes <= 65536):
+                    emit({"type": "diagnostic", "stream": "stderr", "text": clean,
+                          "line_count": 1, "byte_count": encoded_bytes + int(had_delimiter),
+                          "trailing_delimiter_bytes": int(had_delimiter)})
                     diagnostic_lines += 1
                     diagnostic_bytes += encoded_bytes
                 else:
-                    diagnostic_suppressed += 1
+                    if not line_was_truncated:
+                        diagnostic_suppressed += 1
+                    diagnostic_suppressed_bytes += encoded_bytes
         return remainder
 
     def add_protocol_error(message: str) -> None:
@@ -447,11 +511,17 @@ def execute(
     protocol_diagnostic_bytes = 0
     received_output_lines = 0
     received_output_bytes = 0
+    locally_suppressed_lines = 0
+    locally_suppressed_bytes = 0
 
     def handle_remote_record(record: dict[str, object]) -> None:
-        nonlocal remote_exit_count, pending_exit, saw_remote_exit, expected_remote_sequence
+        nonlocal remote_exit_count, pending_exit, remote_process_id, remote_process_started, process_record_seen
+        nonlocal remote_cancellation_confirmed
+        nonlocal saw_remote_payload, saw_remote_exit, expected_remote_sequence
         nonlocal protocol_diagnostics_emitted, protocol_diagnostic_bytes
         nonlocal received_output_lines, received_output_bytes
+        nonlocal remote_diagnostic_lines, remote_diagnostic_bytes
+        nonlocal locally_suppressed_lines, locally_suppressed_bytes
         record_type = record.get("type")
         if record_type == "protocol_error":
             message = str(record.get("message", "remote protocol error"))[:1024]
@@ -468,10 +538,18 @@ def execute(
             if stream not in ("stdout", "stderr") or not isinstance(text, str):
                 add_protocol_error("invalid diagnostic record fields")
                 return
+        elif record_type == "process":
+            pid = record.get("pid")
+            started = record.get("started")
+            if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or
+                    not isinstance(started, int) or isinstance(started, bool) or started <= 0):
+                add_protocol_error("invalid process record fields")
+                return
         elif record_type not in ("output", "exit"):
             add_protocol_error(f"unexpected remote record type {record_type!r}")
             return
         if record_type in ("output", "diagnostic"):
+            saw_remote_payload = True
             stream = record.get("stream")
             text = record.get("text")
             line_count = record.get("line_count")
@@ -510,25 +588,66 @@ def execute(
             record_valid = False
         if not record_valid:
             return
+        if record_type == "process":
+            if saw_remote_payload or saw_remote_exit or process_record_seen:
+                add_protocol_error("duplicate or trailing process record")
+                return
+            process_record_seen = True
+            remote_process_id = cast(int, record["pid"])
+            remote_process_started = cast(int, record["started"])
+            return
         if record_type == "exit":
             remote_exit_count += 1
             saw_remote_exit = True
+            remote_process_id = None
+            remote_process_started = None
+            remote_cancellation_confirmed = True
             if pending_exit is None:
                 pending_exit = dict(record)
             return
         if saw_remote_exit:
             add_protocol_error(f"remote {record_type!r} record followed exit")
             return
+        record_lines = cast(int, record["line_count"])
+        record_bytes = cast(int, record["byte_count"])
         if record_type == "output":
-            received_output_lines += cast(int, record["line_count"])
-            received_output_bytes += cast(int, record["byte_count"])
-        emit(record)
+            if ((max_lines != 0 and received_output_lines + record_lines > max_lines) or
+                    received_output_bytes + record_bytes > max_bytes):
+                add_protocol_error("remote output exceeded requested bounds")
+                return
+            received_output_lines += record_lines
+            received_output_bytes += record_bytes
+            emit(record)
+        else:
+            fits_lines = (max_lines == 0) or (remote_diagnostic_lines + record_lines <= max_lines)
+            fits_bytes = remote_diagnostic_bytes + record_bytes <= max_bytes
+            if not (fits_lines and fits_bytes):
+                locally_suppressed_lines += record_lines
+                locally_suppressed_bytes += record_bytes
+                return
+            remote_diagnostic_lines += record_lines
+            remote_diagnostic_bytes += record_bytes
+            emit(record)
+
+    cancellation_check = None
 
     try:
+        with contextlib.suppress(ImportError, RuntimeError):
+            import anyio.from_thread
+            cancellation_check = anyio.from_thread.check_cancelled
+        if cancellation_check is not None:
+            try:
+                cancellation_check()
+            except RuntimeError:
+                cancellation_check = None
         while selector.get_map():
+            if cancellation_check is not None:
+                cancellation_check()
             now = time.monotonic()
             if not cancellation_reason and now >= request_deadline:
                 cancellation_reason = "timeout"
+                if remote_process_id is not None and not saw_remote_exit:
+                    remote_cancellation_confirmed = cancel_remote_process(host, remote_process_id, remote_process_started)
                 if proc.poll() is None:
                     termination_deadline = now + 2.0
                     try:
@@ -586,6 +705,8 @@ def execute(
                     raw_stdout_bytes += len(data)
                     if raw_stdout_bytes > receive_limit and cancellation_reason is None:
                         cancellation_reason = "receive_budget"
+                        if remote_process_id is not None and not saw_remote_exit:
+                            remote_cancellation_confirmed = cancel_remote_process(host, remote_process_id, remote_process_started)
                         add_protocol_error(
                             f"receive-side byte budget exceeded ({raw_stdout_bytes}>{receive_limit})")
                         termination_deadline = time.monotonic() + 2.0
@@ -597,9 +718,18 @@ def execute(
                     for record in parser.feed(data):
                         handle_remote_record(record)
                 else:
+                    if cancellation_reason is not None:
+                        continue
+                    raw_stderr_bytes += len(data)
+                    if raw_stderr_bytes > 65536:
+                        diagnostic_suppressed += 1
+                        diagnostic_suppressed_bytes += len(data)
+                        continue
                     stderr_text += stderr_decoder.decode(data)
                     stderr_text = emit_stderr_lines(stderr_text)
     except BaseException:
+        if remote_process_id is not None and not saw_remote_exit:
+            cancel_remote_process(host, remote_process_id, remote_process_started)
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -626,14 +756,23 @@ def execute(
         add_protocol_error("transport process did not terminate after forced cancellation")
 
     duration_ms = round((time.monotonic() - started) * 1000)
+    diagnostic_suppressed += locally_suppressed_lines
+    diagnostic_suppressed_bytes += locally_suppressed_bytes
     if diagnostic_suppressed:
-        emit({"type": "diagnostic", "stream": "stderr",
-              "text": f"{diagnostic_suppressed} additional transport diagnostics suppressed"})
+        summary = f"{diagnostic_suppressed} additional diagnostics suppressed"
+        summary_bytes = len(summary.encode("utf-8"))
+        if ((max_lines == 0 or diagnostic_lines + 1 <= max_lines) and
+                diagnostic_bytes + summary_bytes <= max_bytes):
+            emit({"type": "diagnostic", "stream": "stderr", "text": summary,
+                  "line_count": 1, "byte_count": summary_bytes, "trailing_delimiter_bytes": 0})
     if cancellation_reason:
         terminal: dict[str, object] = {
             "type": "terminal", "failure": cancellation_reason,
             "partial": True, "output_complete": False, "exit_code": None,
-            "transport_exit_code": transport_rc, "cancellation_unconfirmed": True,
+            "transport_exit_code": transport_rc,
+            "cancellation_unconfirmed": (not remote_cancellation_confirmed or transport_rc is None),
+            "diagnostic_suppressed_lines": diagnostic_suppressed,
+            "diagnostic_suppressed_bytes": diagnostic_suppressed_bytes,
             "duration_ms": duration_ms,
         }
         if cancellation_reason == "timeout":
@@ -646,11 +785,11 @@ def execute(
         emit(terminal)
         return 124 if cancellation_reason == "timeout" else 1
 
-    pending_exit_code = pending_exit.get("exit_code") if pending_exit is not None else None
-    if host.transport == "ssh" and transport_rc != 0 and pending_exit_code == 0:
-        add_protocol_error(f"SSH transport exited with status {transport_rc!r} after remote success")
-
+    if not process_record_seen:
+        add_protocol_error("missing process record")
     if (remote_exit_count != 1) or protocol_errors or (pending_exit is None):
+        if remote_process_id is not None and not saw_remote_exit:
+            remote_cancellation_confirmed = cancel_remote_process(host, remote_process_id, remote_process_started)
         details = list(protocol_errors)
         if protocol_error_overflow:
             details.append(f"{protocol_error_overflow} additional protocol errors suppressed")
@@ -658,6 +797,8 @@ def execute(
             details.append(f"expected exactly one remote exit record, received {remote_exit_count}")
         emit({"type": "terminal", "failure": "protocol", "message": "; ".join(details),
               "transport_exit_code": transport_rc, "exit_code": None,
+              "diagnostic_suppressed_lines": diagnostic_suppressed,
+              "diagnostic_suppressed_bytes": diagnostic_suppressed_bytes,
               "output_complete": False, "duration_ms": duration_ms})
         return transport_rc or 1
 
@@ -688,6 +829,18 @@ def execute(
         emit({"type": "terminal", "failure": "protocol",
               "message": "invalid remote exit fields: " + ", ".join(invalid_fields),
               "transport_exit_code": transport_rc, "exit_code": None,
+              "diagnostic_suppressed_lines": diagnostic_suppressed,
+              "diagnostic_suppressed_bytes": diagnostic_suppressed_bytes,
+              "output_complete": False, "duration_ms": duration_ms})
+        return transport_rc or 1
+    expected_transport_rc = cast(int, exit_code) & 0xFF
+    if ((host.transport == "ssh" and transport_rc != expected_transport_rc) or
+            (host.transport == "local" and transport_rc != (cast(int, exit_code) & 0xFF))):
+        details = f"{host.transport} transport exited with status {transport_rc!r} after remote exit {exit_code!r}"
+        emit({"type": "terminal", "failure": "transport_exit", "message": details,
+              "transport_exit_code": transport_rc, "exit_code": exit_code,
+              "diagnostic_suppressed_lines": diagnostic_suppressed,
+              "diagnostic_suppressed_bytes": diagnostic_suppressed_bytes,
               "output_complete": False, "duration_ms": duration_ms})
         return transport_rc or 1
     suppressed = [terminal.get(key, 0) for key in
@@ -698,7 +851,10 @@ def execute(
         terminal["remote_sequence"] = remote_sequence
     terminal["source"] = "transport"
     terminal["duration_ms"] = duration_ms
-    terminal["output_complete"] = not any(value for value in suppressed if isinstance(value, int))
+    terminal["diagnostic_suppressed_lines"] = diagnostic_suppressed
+    terminal["diagnostic_suppressed_bytes"] = diagnostic_suppressed_bytes
+    terminal["output_complete"] = (not any(value for value in suppressed if isinstance(value, int)) and
+                                   diagnostic_suppressed == 0)
     terminal["failure"] = None if exit_code == 0 else "remote_exit"
     terminal["transport_exit_code"] = None
     emit(terminal)

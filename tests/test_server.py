@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import anyio
 import os
 import sys
 import tempfile
@@ -57,6 +58,9 @@ class ProtocolTests(unittest.TestCase):
                     await session.initialize()
                     tools = {tool.name: tool for tool in (await session.list_tools()).tools}
                     self.assertIn("list_powershell_targets", tools)
+                    list_schema = tools["list_powershell_targets"].output_schema
+                    self.assertIn("targets", list_schema["properties"])
+                    self.assertIn("targets", list_schema["required"])
                     for name in ("powershell_status", "powershell_run"):
                         tool = tools[name]
                         flag = tool.input_schema["properties"]["include_raw_records"]
@@ -64,9 +68,13 @@ class ProtocolTests(unittest.TestCase):
                             self.assertIn("target", tool.input_schema.get("required", []))
                         self.assertEqual(flag["type"], "boolean")
                         self.assertFalse(flag["default"])
-                        if tool.output_schema is not None:
-                            self.assertIn("records", tool.output_schema["properties"])
-                            self.assertNotIn("records", tool.output_schema.get("required", []))
+                        if name == "powershell_run":
+                            props = tool.input_schema["properties"]
+                            self.assertEqual(props["max_lines"]["minimum"], 0)
+                            self.assertEqual(props["max_lines"]["maximum"], 200)
+                            self.assertEqual(props["max_bytes"]["maximum"], 1_048_576)
+                            self.assertEqual(props["timeout_seconds"]["maximum"], 600)
+                            self.assertIn("regular expression", props["filter"]["description"])
 
                     listed_targets = await session.call_tool("list_powershell_targets", {})
                     self.assertEqual(listed_targets.structured_content, {"targets": [
@@ -87,6 +95,26 @@ class ProtocolTests(unittest.TestCase):
                     )
                     self.assertEqual(failed.content[0].text, "bad\nProcess exited with code 7")
                     self.assertEqual(failed.structured_content["exit_code"], 7)
+
+                    marker = root / "cancelled-marker"
+                    started = anyio.Event()
+                    scope = anyio.CancelScope()
+
+                    async def cancelled_call() -> None:
+                        with scope:
+                            started.set()
+                            await session.call_tool(
+                                "powershell_run",
+                                {"target": "local", "script": f"Start-Sleep -Seconds 2; Set-Content -LiteralPath '{marker}' -Value bad"},
+                            )
+
+                    async with anyio.create_task_group() as tasks:
+                        tasks.start_soon(cancelled_call)
+                        await started.wait()
+                        await anyio.sleep(0.2)
+                        scope.cancel()
+                    await anyio.sleep(2.2)
+                    self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":

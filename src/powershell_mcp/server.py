@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import io
 import os
+
+import anyio
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import Annotated, NotRequired, TypedDict, cast
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, TextContent
+from pydantic import Field
 
 from .runner import SequenceParser, UsageError, execute, load_registry, resolve_target
 
@@ -17,6 +20,17 @@ _DEFAULT_REGISTRY = Path.home() / ".config/powershell-mcp/targets.conf"
 _MAX_LINES = 200
 _MAX_BYTES = 1024 * 1024
 _MAX_TIMEOUT_SECONDS = 600
+
+TargetArg = Annotated[str, Field(pattern=r"^(local|ssh:[A-Za-z0-9][A-Za-z0-9._-]*)$",
+                                 description="Explicit target: 'local' or a registered 'ssh:<alias>'.")]
+MaxLinesArg = Annotated[int, Field(ge=0, le=_MAX_LINES,
+                                   description="Maximum output lines; 0 disables only the line limit and remains byte-bounded.")]
+MaxBytesArg = Annotated[int, Field(ge=1, le=_MAX_BYTES,
+                                   description="Maximum UTF-8 command output bytes; excludes the short terminal status decoration.")]
+TimeoutArg = Annotated[int, Field(ge=1, le=_MAX_TIMEOUT_SECONDS,
+                                  description="Execution timeout in seconds.")]
+FilterArg = Annotated[str | None, Field(description="Optional case-insensitive .NET regular expression with a 100 ms match timeout.")]
+RawRecordsArg = Annotated[bool, Field(description="Include low-level protocol records for diagnostics; may expose sensitive output details.")]
 
 
 @dataclass
@@ -44,6 +58,17 @@ class CommandResult:
     line_suppressed_bytes: int = 0
     byte_suppressed_lines: int = 0
     byte_suppressed_bytes: int = 0
+    diagnostic_suppressed_lines: int = 0
+    diagnostic_suppressed_bytes: int = 0
+
+
+class TargetInfo(TypedDict):
+    id: str
+    kind: str
+
+
+class TargetListResult(TypedDict):
+    targets: list[TargetInfo]
 
 
 class PublicCommandResult(TypedDict):
@@ -68,6 +93,8 @@ class PublicCommandResult(TypedDict):
     line_suppressed_bytes: NotRequired[int]
     byte_suppressed_lines: NotRequired[int]
     byte_suppressed_bytes: NotRequired[int]
+    diagnostic_suppressed_lines: NotRequired[int]
+    diagnostic_suppressed_bytes: NotRequired[int]
     records: NotRequired[list[dict[str, object]]]
 
 
@@ -152,7 +179,8 @@ def command_result_from_records(records: list[dict[str, object]], target: str,
     result.cancellation_unconfirmed = terminal.get("cancellation_unconfirmed") is True
     for name in ("duration_ms", "observed_lines", "observed_bytes", "emitted_lines", "emitted_bytes",
                  "filter_suppressed_lines", "filter_suppressed_bytes", "line_suppressed_lines",
-                 "line_suppressed_bytes", "byte_suppressed_lines", "byte_suppressed_bytes"):
+                 "line_suppressed_bytes", "byte_suppressed_lines", "byte_suppressed_bytes",
+                 "diagnostic_suppressed_lines", "diagnostic_suppressed_bytes"):
         value = terminal.get(name)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             setattr(result, name, value)
@@ -186,6 +214,8 @@ def public_result(result: CommandResult, include_raw_records: bool = False) -> P
         "line_suppressed_bytes": result.line_suppressed_bytes,
         "byte_suppressed_lines": result.byte_suppressed_lines,
         "byte_suppressed_bytes": result.byte_suppressed_bytes,
+        "diagnostic_suppressed_lines": result.diagnostic_suppressed_lines,
+        "diagnostic_suppressed_bytes": result.diagnostic_suppressed_bytes,
     }
     if any(suppression.values()):
         for name, value in suppression.items():
@@ -202,52 +232,62 @@ def public_result(result: CommandResult, include_raw_records: bool = False) -> P
 def display_result(result: CommandResult, include_raw_records: bool = False) -> CallToolResult:
     structured = public_result(result, include_raw_records)
     text = result.output
-    if result.exit_code not in (None, 0):
-        suffix = f"Process exited with code {result.exit_code}"
-        text = f"{text}{'' if not text or text.endswith(chr(10)) else chr(10)}{suffix}"
-    elif result.failure is not None and result.exit_code is None:
+    if result.failure not in (None, "remote_exit"):
         suffix = f"PowerShell execution failed: {result.failure}"
+        if result.message:
+            suffix += f" ({result.message})"
+        text = f"{text}{'' if not text or text.endswith(chr(10)) else chr(10)}{suffix}"
+    elif result.exit_code not in (None, 0):
+        suffix = f"Process exited with code {result.exit_code}"
         text = f"{text}{'' if not text or text.endswith(chr(10)) else chr(10)}{suffix}"
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
         structured_content=structured,
-        is_error=False,
+        is_error=result.failure not in (None, "remote_exit"),
     )
 
 
 mcp = MCPServer("powershell", instructions="Run bounded PowerShell on explicit local or registered SSH targets; command failures are structured results, not tool errors.")
+_EXECUTION_LIMITER = anyio.CapacityLimiter(16)
 
 @mcp.tool(structured_output=True)
-def list_powershell_targets() -> dict[str, list[dict[str, str]]]:
+def list_powershell_targets() -> TargetListResult:
     """List public-safe explicit local and registered SSH target identifiers."""
-    targets = [{"id": "local", "kind": "local"}]
-    targets.extend({"id": f"ssh:{alias}", "kind": "ssh"} for alias in load_hosts())
+    targets: list[TargetInfo] = [{"id": "local", "kind": "local"}]
+    targets.extend(TargetInfo(id=f"ssh:{alias}", kind="ssh") for alias in load_hosts())
     return {"targets": targets}
 
 
 @mcp.tool()
-def powershell_status(target: str, include_raw_records: bool = False) -> CallToolResult:
+async def powershell_status(target: TargetArg, include_raw_records: RawRecordsArg = False) -> Annotated[CallToolResult, PublicCommandResult]:
     """Check an explicit local or registered SSH PowerShell target."""
-    require_target(target)
     script = "$PSVersionTable.PSVersion.ToString(); [Environment]::MachineName"
-    result = run_target(target, script, 2, 4096, None, 30)
+    with anyio.fail_after(50):
+        result = await anyio.to_thread.run_sync(
+            run_target, target, script, 2, 4096, None, 30, limiter=_EXECUTION_LIMITER
+        )
     return display_result(result, include_raw_records)
 
 
 @mcp.tool()
-def powershell_run(target: str, script: str, max_lines: int = 40,
-                   max_bytes: int = 65536, filter: str | None = None,
-                   timeout_seconds: int = 120,
-                   include_raw_records: bool = False) -> PublicCommandResult:
+async def powershell_run(target: TargetArg, script: Annotated[str, Field(min_length=1,
+                         description="PowerShell script executed with the selected target account's authority.")],
+                   max_lines: MaxLinesArg = 40,
+                   max_bytes: MaxBytesArg = 65536, filter: FilterArg = None,
+                   timeout_seconds: TimeoutArg = 120,
+                   include_raw_records: RawRecordsArg = False) -> Annotated[CallToolResult, PublicCommandResult]:
     """Run bounded PowerShell on target='local' or target='ssh:<registered-alias>'."""
-    require_target(target)
     if not script.strip(): raise ToolError("PowerShell script must not be empty")
     if not 0 <= max_lines <= _MAX_LINES: raise ToolError(f"max_lines must be between 0 and {_MAX_LINES}")
     if not 1 <= max_bytes <= _MAX_BYTES: raise ToolError(f"max_bytes must be between 1 and {_MAX_BYTES}")
     if not 1 <= timeout_seconds <= _MAX_TIMEOUT_SECONDS: raise ToolError(f"timeout_seconds must be between 1 and {_MAX_TIMEOUT_SECONDS}")
     if filter == "": raise ToolError("filter must not be empty when provided")
-    return display_result(run_target(target, script, max_lines, max_bytes, filter, timeout_seconds),
-                          include_raw_records)
+    with anyio.fail_after(timeout_seconds + 20):
+        result = await anyio.to_thread.run_sync(
+            run_target, target, script, max_lines, max_bytes, filter, timeout_seconds,
+            limiter=_EXECUTION_LIMITER,
+        )
+    return display_result(result, include_raw_records)
 
 
 

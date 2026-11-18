@@ -31,18 +31,20 @@ class ScriptTests(unittest.TestCase):
                     item.setdefault("byte_count", len(item.get("text", "").encode()) + item["trailing_delimiter_bytes"])
                 sys.stdout.buffer.write(b"\x1e" + json.dumps(item).encode() + b"\n")
                 sys.stdout.buffer.flush()
-            record({"type":"output", "source":"remote", "sequence":1,
+            record({"type":"process", "source":"remote", "sequence":1, "pid":1234, "started":133801632000000000})
+            record({"type":"output", "source":"remote", "sequence":2,
                     "stream":"stdout", "text":"eof" if value == "" else "unexpected"})
-            record({"type":"exit", "source":"remote", "sequence":2, "exit_code":0, "observed_lines":1, "observed_bytes":4, "emitted_lines":1, "emitted_bytes":4, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
+            record({"type":"exit", "source":"remote", "sequence":3, "exit_code":0, "observed_lines":1, "observed_bytes":4, "emitted_lines":1, "emitted_bytes":4, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
         ''')
         self.assertEqual(status, 0)
         self.assertIn("eof", [record.get("text") for record in records])
 
     def test_local_target_uses_direct_pwsh_without_shell(self) -> None:
-        with patch.dict(os.environ, {"POWERSHELL_MCP_PWSH": str(Path.home() / ".local/bin/pwsh")}):
+        executable = Path(sys.executable)
+        with patch.dict(os.environ, {"POWERSHELL_MCP_PWSH": str(executable)}):
             target = resolve_target("local")
         argv = launch_argv(target, "Write-Output ok")
-        self.assertEqual(argv[0], str((Path.home() / ".local/bin/pwsh").resolve()))
+        self.assertEqual(argv[0], str(executable.resolve()))
         self.assertNotIn("sh", argv[:1])
         self.assertIn("-EncodedCommand", argv)
 
@@ -79,9 +81,10 @@ class ScriptTests(unittest.TestCase):
                     value.setdefault("byte_count", len(value.get("text", "").encode()) + value["trailing_delimiter_bytes"])
                 sys.stdout.buffer.write(b"\x1e" + json.dumps(value).encode() + b"\n")
                 sys.stdout.buffer.flush()
-            record({"type":"output", "source":"remote", "sequence":1,
+            record({"type":"process", "source":"remote", "sequence":1, "pid":1234, "started":133801632000000000})
+            record({"type":"output", "source":"remote", "sequence":2,
                     "stream":"stdout", "text":"ok"})
-            record({"type":"exit", "source":"remote", "sequence":2, "exit_code":0, "observed_lines":1, "observed_bytes":3, "emitted_lines":1, "emitted_bytes":3, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
+            record({"type":"exit", "source":"remote", "sequence":3, "exit_code":0, "observed_lines":1, "observed_bytes":3, "emitted_lines":1, "emitted_bytes":3, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
             time.sleep(0.05)
             sys.stderr.write("late diagnostic\n"); sys.stderr.flush()
         ''')
@@ -112,7 +115,7 @@ class ScriptTests(unittest.TestCase):
                         if value.get("type") == "output":
                             value.setdefault("line_count", value.get("text", "").count("\n") + 1)
                             value.setdefault("trailing_delimiter_bytes", 1)
-                    value.setdefault("byte_count", len(value.get("text", "").encode()) + value["trailing_delimiter_bytes"])
+                            value.setdefault("byte_count", len(value.get("text", "").encode()) + value["trailing_delimiter_bytes"])
                         sys.stdout.buffer.write(b"\\x1e" + json.dumps(value).encode() + b"\\n")
                         sys.stdout.buffer.flush()
                     {statements}
@@ -187,19 +190,21 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(records[-1]["failure"], "timeout")
         self.assertEqual(sum(record["type"] == "terminal" for record in records), 1)
         self.assertNotIn("shutdown output", [record.get("text") for record in records])
-        self.assertIn("shutdown diagnostic", [record.get("text") for record in records])
+        self.assertNotIn("shutdown diagnostic", [record.get("text") for record in records])
 
     def test_nonzero_transport_status_overrides_remote_success(self) -> None:
         status, records = self.run_helper(r'''
             import json, sys
-            value = {"type":"exit", "source":"remote", "sequence":1, "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0}
+            record = lambda value: (sys.stdout.buffer.write(b"\x1e" + json.dumps(value).encode() + b"\n"), sys.stdout.buffer.flush())
+            record({"type":"process", "source":"remote", "sequence":1, "pid":1234, "started":133801632000000000})
+            value = {"type":"exit", "source":"remote", "sequence":2, "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0}
             sys.stdout.buffer.write(b"\x1e" + json.dumps(value).encode() + b"\n")
             sys.stdout.buffer.flush()
             raise SystemExit(255)
         ''')
         self.assertNotEqual(status, 0)
-        self.assertEqual(records[-1]["failure"], "protocol")
-        self.assertIn("SSH transport exited with status 255", records[-1]["message"])
+        self.assertEqual(records[-1]["failure"], "transport_exit")
+        self.assertIn("ssh transport exited with status 255", records[-1]["message"])
 
     def test_unlimited_lines_are_bounded_only_by_bytes(self) -> None:
         body = r'''
@@ -210,10 +215,11 @@ class ScriptTests(unittest.TestCase):
                     value.setdefault("trailing_delimiter_bytes", 1)
                     value.setdefault("byte_count", len(value.get("text", "").encode()) + value["trailing_delimiter_bytes"])
                 sys.stdout.buffer.write(b"\x1e" + json.dumps(value).encode() + b"\n")
-            for sequence in range(1, 501):
+            record({"type":"process", "source":"remote", "sequence":1, "pid":1234, "started":133801632000000000})
+            for sequence in range(2, 502):
                 record({"type":"output", "source":"remote", "sequence":sequence,
                         "stream":"stdout", "text":"x"})
-            record({"type":"exit", "source":"remote", "sequence":501, "exit_code":0, "observed_lines":500, "observed_bytes":1000, "emitted_lines":500, "emitted_bytes":1000, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
+            record({"type":"exit", "source":"remote", "sequence":502, "exit_code":0, "observed_lines":500, "observed_bytes":1000, "emitted_lines":500, "emitted_bytes":1000, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
             sys.stdout.buffer.flush()
         '''
         output = io.BytesIO()

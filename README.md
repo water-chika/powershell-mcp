@@ -61,10 +61,12 @@ Configure a pinned local runtime with `POWERSHELL_MCP_PWSH`; otherwise `pwsh` is
 Normal results contain only:
 
 ```json
-{"output":"...","exit_code":0}
+{"output":"..."}
 ```
 
-Failure, truncation, timeout, and raw protocol fields appear only when relevant. Raw records are opt-in with `include_raw_records: true`.
+Successful results omit `exit_code`. A nonzero command exit adds `exit_code` and remains a normal tool result. Infrastructure failures (timeout, transport, protocol, or receive budget) set MCP `isError` and include bounded structured details. Raw records are opt-in with `include_raw_records: true`.
+
+`filter` is a case-insensitive .NET regular expression with a 100 ms match timeout. `max_lines=0` disables the line limit but remains byte-bounded.
 
 ## Bounds and security
 
@@ -72,7 +74,7 @@ This tool executes arbitrary PowerShell with the selected account's authority. I
 
 - `target` is mandatory.
 - SSH targets are allowlisted.
-- Line, byte, record, diagnostic, and time limits are enforced.
+- Line and byte limits apply to command output; short terminal status decoration is separate. Record, diagnostic, and time limits are also enforced.
 - Process groups receive bounded TERM/KILL cleanup.
 - Exactly one terminal protocol record must be last.
 - Normal OpenSSH host-key verification is retained.

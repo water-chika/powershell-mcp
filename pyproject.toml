@@ -9,7 +9,7 @@ description = "Bounded PowerShell MCP for explicit local and registered SSH targ
 readme = "README.md"
 requires-python = ">=3.11"
 license = {file = "LICENSE"}
-dependencies = ["mcp>=2.3,<3"]
+dependencies = ["mcp>=2.3,<3", "anyio>=4,<5", "pydantic>=2,<3"]
 keywords = ["mcp", "powershell", "ssh", "automation"]
 classifiers = [
   "Development Status :: 3 - Alpha",
