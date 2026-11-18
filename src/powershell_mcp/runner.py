@@ -38,7 +38,7 @@ class UsageError(ValueError):
 class Host:
     alias: str
     spec: str
-    mode: str = "cmd"
+    mode: str = "powershell"
     transport: str = "ssh"
 
 
@@ -58,16 +58,18 @@ def load_registry(path: Path | None = None) -> dict[str, Host]:
         fields = [part.strip() for part in line.split("|")]
         if len(fields) < 2 or not fields[0] or not fields[1]:
             raise UsageError(f"malformed wsh host registry line {number}")
+        if len(fields) > 3:
+            raise UsageError(f"too many fields in PowerShell target registry line {number}")
         alias, spec = fields[:2]
-        mode = fields[2] if len(fields) > 2 and fields[2] else "cmd"
+        mode = fields[2] if len(fields) > 2 and fields[2] else "powershell"
+        if alias == "local":
+            raise UsageError("reserved target alias 'local' cannot appear in the SSH registry")
         if not _ALIAS.fullmatch(alias):
             raise UsageError(f"invalid wsh host alias on line {number}")
         if alias in result:
             raise UsageError(f"duplicate wsh host alias '{alias}'")
-        if mode not in ("cmd", "powershell"):
-            raise UsageError(
-                f"bad payload language '{mode}' for host '{alias}' (expected cmd or powershell)"
-            )
+        if mode != "powershell":
+            raise UsageError(f"bad payload language '{mode}' for host '{alias}' (expected powershell)")
         result[alias] = Host(alias, spec, mode)
     return result
 
@@ -78,7 +80,7 @@ def resolve_host(alias: str, *, registered_only: bool = False) -> Host:
         return hosts[alias]
     if registered_only:
         raise UsageError(f"unknown wsh host alias '{alias}'")
-    return Host(alias, alias, "cmd")
+    return Host(alias, alias, "powershell")
 
 
 def resolve_target(target: str, path: Path | None = None) -> Host:
@@ -123,19 +125,51 @@ def build_remote_script(
     powershell_executable: str = "pwsh.exe",
 ) -> str:
     """Build a streaming target program with finite target-side budgets."""
-    if mode not in ("cmd", "powershell"):
-        raise UsageError("mode must be cmd or powershell")
+    if mode != "powershell":
+        raise UsageError("mode must be powershell")
     if not 0 <= max_lines <= _MAX_LINES:
         raise UsageError(f"max_lines must be between 0 and {_MAX_LINES}")
     if not 1 <= max_bytes <= _MAX_BYTES:
         raise UsageError(f"max_bytes must be between 1 and {_MAX_BYTES}")
     if mode == "powershell":
-        # A literal `exit N` terminates its runspace before a same-process wrapper
-        # can emit the final frame. A child pwsh keeps that status observable.
-        invoke = ("$encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command)); "
-                  f"& {_ps_literal(powershell_executable)} -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded")
-    else:
-        invoke = "& cmd.exe /d /c $command"
+        # Redirect the child process's two OS streams and consume whichever line
+        # becomes readable first. PowerShell's pipeline merger can defer ErrorRecord
+        # formatting and reorder stderr behind later stdout.
+        invoke = f"""
+$encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+$psi=[Diagnostics.ProcessStartInfo]::new()
+$psi.FileName={_ps_literal(powershell_executable)}
+$psi.UseShellExecute=$false
+$psi.RedirectStandardOutput=$true
+$psi.RedirectStandardError=$true
+$psi.ArgumentList.Add('-NoLogo'); $psi.ArgumentList.Add('-NoProfile'); $psi.ArgumentList.Add('-NonInteractive')
+$psi.ArgumentList.Add('-OutputFormat'); $psi.ArgumentList.Add('Text')
+$psi.ArgumentList.Add('-EncodedCommand'); $psi.ArgumentList.Add($encoded)
+$child=[Diagnostics.Process]::new(); $child.StartInfo=$psi
+if (-not $child.Start()) {{ throw 'failed to start child PowerShell' }}
+$outBuffer=[char[]]::new(4096); $errBuffer=[char[]]::new(4096)
+$outTask=$child.StandardOutput.ReadAsync($outBuffer,0,$outBuffer.Length); $errTask=$child.StandardError.ReadAsync($errBuffer,0,$errBuffer.Length)
+try {{
+  while (($null -ne $outTask) -or ($null -ne $errTask)) {{
+    $tasks=[Collections.Generic.List[Threading.Tasks.Task[int]]]::new()
+    if ($null -ne $outTask) {{ $tasks.Add($outTask) }}; if ($null -ne $errTask) {{ $tasks.Add($errTask) }}
+    $completed=[Threading.Tasks.Task]::WhenAny([Threading.Tasks.Task[int][]]$tasks.ToArray()).GetAwaiter().GetResult()
+    if ([object]::ReferenceEquals($completed, $outTask)) {{
+      $count=$outTask.GetAwaiter().GetResult()
+      if ($count -eq 0) {{ Observe-Text '' 'stdout' $true; $outTask=$null }}
+      else {{ Observe-Text ([string]::new($outBuffer,0,$count)) 'stdout' $false; $outTask=$child.StandardOutput.ReadAsync($outBuffer,0,$outBuffer.Length) }}
+    }} else {{
+      $count=$errTask.GetAwaiter().GetResult()
+      if ($count -eq 0) {{ Observe-Text '' 'stderr' $true; $errTask=$null }}
+      else {{ Observe-Text ([string]::new($errBuffer,0,$count)) 'stderr' $false; $errTask=$child.StandardError.ReadAsync($errBuffer,0,$errBuffer.Length) }}
+    }}
+  }}
+  $child.WaitForExit(); $script:nativeRc=$child.ExitCode
+}} finally {{
+  if (-not $child.HasExited) {{ $child.Kill($true); $child.WaitForExit(2000) | Out-Null }}
+  $child.Dispose()
+}}
+"""
     filter_expr = "$null" if pattern is None else _ps_literal(pattern)
     # The wire format is itself RFC 7464. Console.Write bypasses PowerShell's
     # CLIXML serializer and flushes every observed line before the next arrives.
@@ -146,6 +180,8 @@ $pattern={filter_expr}; $lineLimit={max_lines}; $byteLimit={max_bytes}
 $script:seenLines=0; $script:seenBytes=0; $script:sentLines=0; $script:sentBytes=0; $script:seq=0
 $script:filterLines=0; $script:filterBytes=0; $script:lineLines=0; $script:lineBytes=0; $script:byteLines=0; $script:byteBytes=0
 $script:hadError=$false; $script:nativeRc=$null
+$script:pendingText=@{{stdout='';stderr=''}}
+$script:outputStream=$null; $script:outputLines=[Collections.Generic.List[string]]::new(); $script:outputBatchBytes=0
 function Send-Record([hashtable]$record) {{
   $script:seq++; $record.sequence=$script:seq; $record.source='remote'
   $json=$record | ConvertTo-Json -Compress -Depth 5
@@ -156,12 +192,27 @@ if ($null -ne $pattern) {{
   try {{ $regex=[regex]::new($pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase) }}
   catch {{ Send-Record @{{type='exit'; exit_code=2; message=('wsh: bad -f pattern: ' + $_.Exception.Message); observed_lines=0; observed_bytes=0; emitted_lines=0; emitted_bytes=0; filter_suppressed_lines=0; filter_suppressed_bytes=0; line_suppressed_lines=0; line_suppressed_bytes=0; byte_suppressed_lines=0; byte_suppressed_bytes=0}}; exit 2 }}
 }}
-function Observe([object]$item) {{
-  $stream=if ($item -is [System.Management.Automation.ErrorRecord]) {{ $script:hadError=$true; 'stderr' }} else {{ 'stdout' }}
-  $text=if ($item -is [System.Management.Automation.ErrorRecord]) {{ $item.ToString() }} else {{ $item | Out-String -Stream }}
-  foreach ($part in @($text)) {{
-    foreach ($line in @([regex]::Split([string]$part, "`r?`n"))) {{
-      if ($line -eq '' -and $part -notmatch "[`r`n]$") {{ continue }}
+function Flush-Output {{
+  if ($script:outputLines.Count -gt 0) {{
+    Send-Record @{{type='output'; stream=$script:outputStream; text=($script:outputLines -join "`n")}}
+    $script:outputLines.Clear(); $script:outputBatchBytes=0
+  }}
+}}
+function Observe-Text([string]$text, [string]$stream, [bool]$final) {{
+  $combined=$script:pendingText[$stream] + $text
+  $parts=[regex]::Split($combined, "`r?`n")
+  if (-not $final) {{
+    $script:pendingText[$stream]=$parts[-1]
+    $completeCount=$parts.Length-1
+  }} else {{
+    $script:pendingText[$stream]=''
+    $completeCount=$parts.Length
+    if (($completeCount -gt 0) -and ($parts[-1] -eq '')) {{ $completeCount-- }}
+  }}
+  for ($i=0; $i -lt $completeCount; $i++) {{ Observe-Line $parts[$i] $stream }}
+}}
+function Observe-Line([string]$line, [string]$stream) {{
+      if ($stream -eq 'stderr') {{ $script:hadError=$true }}
       $bytes=[Text.Encoding]::UTF8.GetByteCount($line + "`n")
       $script:seenLines++; $script:seenBytes += $bytes
       $matched=($null -eq $regex) -or $regex.IsMatch($line)
@@ -171,13 +222,16 @@ function Observe([object]$item) {{
       elseif (-not $withinLines) {{ $script:lineLines++; $script:lineBytes += $bytes }}
       elseif (-not $withinBytes) {{ $script:byteLines++; $script:byteBytes += $bytes }}
       else {{
-        Send-Record @{{type='output'; stream=$stream; text=$line}}; $script:sentLines++; $script:sentBytes += $bytes
+        if (($script:outputStream -ne $stream) -or
+            ($script:outputLines.Count -ge 255) -or
+            ($script:outputBatchBytes + $bytes -gt 8192)) {{ Flush-Output }}
+        if ($script:outputLines.Count -eq 0) {{ $script:outputStream=$stream }}
+        $script:outputLines.Add($line); $script:outputBatchBytes += $bytes
+        $script:sentLines++; $script:sentBytes += $bytes
       }}
-    }}
-  }}
 }}
-try {{ & {{ {invoke}; $script:nativeRc=$LASTEXITCODE }} 2>&1 | ForEach-Object {{ Observe $_ }} }}
-catch {{ Observe $_; if ($script:nativeRc -eq $null) {{ $script:nativeRc=1 }} }}
+try {{ {invoke}; Flush-Output }}
+catch {{ Flush-Output; Observe-Line $_.ToString() 'stderr'; Flush-Output; if ($script:nativeRc -eq $null) {{ $script:nativeRc=1 }} }}
 $rc=$script:nativeRc
 if ($rc -eq $null) {{ $rc=if ($script:hadError) {{1}} else {{0}} }}
 Send-Record @{{type='exit'; exit_code=[int64]$rc; observed_lines=$script:seenLines; observed_bytes=$script:seenBytes; emitted_lines=$script:sentLines; emitted_bytes=$script:sentBytes; filter_suppressed_lines=$script:filterLines; filter_suppressed_bytes=$script:filterBytes; line_suppressed_lines=$script:lineLines; line_suppressed_bytes=$script:lineBytes; byte_suppressed_lines=$script:byteLines; byte_suppressed_bytes=$script:byteBytes}}
@@ -365,6 +419,12 @@ def execute(
         if record_type not in ("output", "exit"):
             add_protocol_error(f"unexpected remote record type {record_type!r}")
             return
+        if record_type == "output":
+            stream = record.get("stream")
+            text = record.get("text")
+            if stream not in ("stdout", "stderr") or not isinstance(text, str):
+                add_protocol_error("invalid output record fields")
+                return
         sequence = record.get("sequence")
         if (not isinstance(sequence, int) or isinstance(sequence, bool) or
                 sequence != expected_remote_sequence):
@@ -408,6 +468,10 @@ def execute(
                 drain_deadline = now + 2.0
             if drain_deadline is not None and now >= drain_deadline:
                 add_protocol_error("transport pipes did not reach EOF after process exit")
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 for key in list(selector.get_map().values()):
                     selector.unregister(key.fileobj)
                     cast(BinaryIO, key.fileobj).close()
@@ -520,7 +584,7 @@ def execute(
     counter_names = ("observed_lines", "observed_bytes", "emitted_lines", "emitted_bytes",
                      "filter_suppressed_lines", "filter_suppressed_bytes", "line_suppressed_lines",
                      "line_suppressed_bytes", "byte_suppressed_lines", "byte_suppressed_bytes")
-    invalid_fields = []
+    invalid_fields = [name for name in counter_names if name not in terminal]
     if not isinstance(exit_code, int) or isinstance(exit_code, bool):
         invalid_fields.append("exit_code")
     for name in counter_names:
@@ -550,7 +614,7 @@ def execute(
 
 def backend_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wsh-jsonseq", description="Run a Windows command and emit RFC 7464 JSON text sequences")
-    parser.add_argument("--mode", choices=("cmd", "powershell"))
+    parser.add_argument("--mode", choices=("powershell",))
     parser.add_argument("--max-lines", type=int, default=_DEFAULT_LINES)
     parser.add_argument("--max-bytes", type=int, default=_DEFAULT_BYTES)
     parser.add_argument("--filter")

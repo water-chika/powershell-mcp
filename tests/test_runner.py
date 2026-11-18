@@ -29,7 +29,7 @@ class ScriptTests(unittest.TestCase):
                 sys.stdout.buffer.flush()
             record({"type":"output", "source":"remote", "sequence":1,
                     "stream":"stdout", "text":"eof" if value == "" else "unexpected"})
-            record({"type":"exit", "source":"remote", "sequence":2, "exit_code":0})
+            record({"type":"exit", "source":"remote", "sequence":2, "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
         ''')
         self.assertEqual(status, 0)
         self.assertIn("eof", [record.get("text") for record in records])
@@ -73,7 +73,7 @@ class ScriptTests(unittest.TestCase):
                 sys.stdout.buffer.flush()
             record({"type":"output", "source":"remote", "sequence":1,
                     "stream":"stdout", "text":"ok"})
-            record({"type":"exit", "source":"remote", "sequence":2, "exit_code":0})
+            record({"type":"exit", "source":"remote", "sequence":2, "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
             time.sleep(0.05)
             sys.stderr.write("late diagnostic\n"); sys.stderr.flush()
         ''')
@@ -87,14 +87,14 @@ class ScriptTests(unittest.TestCase):
     def test_duplicate_missing_and_trailing_records_are_protocol_failures(self) -> None:
         cases = {
             "missing": 'record({"type":"output", "text":"x"})',
-            "duplicate": 'record({"type":"exit", "exit_code":0}); record({"type":"exit", "exit_code":0})',
-            "trailing": 'record({"type":"exit", "exit_code":0}); record({"type":"output", "text":"late"})',
+            "duplicate": 'record({"type":"exit", "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0}); record({"type":"exit", "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})',
+            "trailing": 'record({"type":"exit", "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0}); record({"type":"output", "text":"late"})',
             "incomplete": 'sys.stdout.buffer.write(b"\\x1e{\\\"type\\\":\\\"exit\\\""); sys.stdout.buffer.flush()',
             "bad-exit-type": 'record({"type":"exit", "exit_code":"0"})',
             "bad-counter": 'record({"type":"exit", "exit_code":0, "observed_lines":false})',
-            "reserved-terminal": 'record({"type":"terminal", "exit_code":0}); record({"type":"exit", "exit_code":0})',
-            "unknown-type": 'record({"type":"mystery"}); record({"type":"exit", "exit_code":0})',
-            "bad-sequence": 'record({"type":"output", "source":"remote", "sequence":2, "text":"x"}); record({"type":"exit", "source":"remote", "sequence":1, "exit_code":0})',
+            "reserved-terminal": 'record({"type":"terminal", "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0}); record({"type":"exit", "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})',
+            "unknown-type": 'record({"type":"mystery"}); record({"type":"exit", "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})',
+            "bad-sequence": 'record({"type":"output", "source":"remote", "sequence":2, "text":"x"}); record({"type":"exit", "source":"remote", "sequence":1, "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})',
         }
         for name, statements in cases.items():
             with self.subTest(name=name):
@@ -109,6 +109,24 @@ class ScriptTests(unittest.TestCase):
                 self.assertEqual(sum(record["type"] == "terminal" for record in records), 1)
                 self.assertEqual(records[-1]["type"], "terminal")
                 self.assertEqual(records[-1]["failure"], "protocol")
+
+    def test_real_powershell_preserves_newline_free_and_blank_lines(self) -> None:
+        from powershell_mcp.server import powershell_run
+        no_newline = powershell_run("local", "[Console]::Out.Write('abcdefghij')")
+        self.assertEqual(no_newline["output"], "abcdefghij")
+        blank = powershell_run("local", "Write-Output ''; Write-Output x", include_raw_records=True)
+        texts = [record["text"] for record in blank["records"] if record.get("type") == "output"]
+        self.assertEqual(texts, ["\nx"])
+
+    def test_real_powershell_preserves_stderr_before_later_stdout(self) -> None:
+        from powershell_mcp.server import powershell_run
+        result = powershell_run(
+            "local",
+            "Write-Error bad; Start-Sleep -Milliseconds 50; Write-Output x",
+            include_raw_records=True,
+        )
+        streams = [record["stream"] for record in result["records"] if record.get("type") == "output"]
+        self.assertEqual(streams, ["stderr", "stdout"])
 
     def test_timeout_drains_shutdown_output_before_terminal(self) -> None:
         status, records = self.run_helper(r'''
@@ -133,7 +151,7 @@ class ScriptTests(unittest.TestCase):
     def test_nonzero_transport_status_overrides_remote_success(self) -> None:
         status, records = self.run_helper(r'''
             import json, sys
-            value = {"type":"exit", "source":"remote", "sequence":1, "exit_code":0}
+            value = {"type":"exit", "source":"remote", "sequence":1, "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0}
             sys.stdout.buffer.write(b"\x1e" + json.dumps(value).encode() + b"\n")
             sys.stdout.buffer.flush()
             raise SystemExit(255)
@@ -150,7 +168,7 @@ class ScriptTests(unittest.TestCase):
             for sequence in range(1, 501):
                 record({"type":"output", "source":"remote", "sequence":sequence,
                         "stream":"stdout", "text":"x"})
-            record({"type":"exit", "source":"remote", "sequence":501, "exit_code":0})
+            record({"type":"exit", "source":"remote", "sequence":501, "exit_code":0, "observed_lines":0, "observed_bytes":0, "emitted_lines":0, "emitted_bytes":0, "filter_suppressed_lines":0, "filter_suppressed_bytes":0, "line_suppressed_lines":0, "line_suppressed_bytes":0, "byte_suppressed_lines":0, "byte_suppressed_bytes":0})
             sys.stdout.buffer.flush()
         '''
         output = io.BytesIO()
@@ -162,6 +180,22 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(records[-1]["exit_code"], 0)
         self.assertEqual(sum(record.get("type") == "output" for record in records), 500)
+
+    def test_receive_budget_is_distinct_from_timeout(self) -> None:
+        output = io.BytesIO()
+        body = r'''
+            import os, sys, time
+            os.write(sys.stdout.fileno(), b"x" * 200000)
+            time.sleep(5)
+        '''
+        argv = [sys.executable, "-c", textwrap.dedent(body)]
+        with patch("powershell_mcp.runner.launch_argv", return_value=argv):
+            status = execute(Host("test", "unused", "powershell"), "ignored", mode="powershell",
+                             max_lines=1, max_bytes=1, pattern=None, timeout=30, output=output)
+        records = decode(output.getvalue())
+        self.assertEqual(status, 1)
+        self.assertEqual(records[-1]["failure"], "receive_budget")
+        self.assertNotIn("timeout_seconds", records[-1])
 
     def test_timeout_preserves_protocol_error_details(self) -> None:
         status, records = self.run_helper(r'''
@@ -192,7 +226,7 @@ class ScriptTests(unittest.TestCase):
         fake_stdout = type("Stdout", (), {"buffer": output})()
         with patch("sys.stdout", fake_stdout), patch("sys.stdin", io.StringIO("Write-Output ok")), \
              patch.dict(os.environ, {"POWERSHELL_MCP_DRYRUN": "1", "POWERSHELL_MCP_REGISTRY": "/nonexistent"}, clear=False):
-            self.assertEqual(backend_main(["--script-stdin", "host"]), 0)
+            self.assertEqual(backend_main(["--mode", "powershell", "--script-stdin", "host"]), 0)
         request = decode(output.getvalue())[0]
         self.assertEqual(request["type"], "request")
         self.assertIn("V3JpdGUtT3V0cHV0IG9r", request["remote_script"])

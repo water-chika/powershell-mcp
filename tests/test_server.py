@@ -20,8 +20,11 @@ class RegistryTests(unittest.TestCase):
     def test_lists_aliases_and_rejects_bad_registry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             registry = Path(directory) / "hosts.conf"
-            registry.write_text("# x\nalpha | developer@example.invalid | powershell\nbeta|-p 2222 developer@127.0.0.1|cmd\n")
+            registry.write_text("# x\nalpha | developer@example.invalid | powershell\nbeta|-p 2222 developer@127.0.0.1|powershell\n")
             self.assertEqual(load_hosts(registry), ("alpha", "beta"))
+            registry.write_text("badmode | developer@example.invalid | cmd\n")
+            with self.assertRaisesRegex(ToolError, "expected powershell"):
+                load_hosts(registry)
             registry.write_text("bad row\n")
             with self.assertRaisesRegex(ToolError, "malformed"):
                 load_hosts(registry)
